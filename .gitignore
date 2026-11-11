@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+config/monitor.toml
+config/capture.toml
+.DS_Store
+config/captures/
+config/agent.toml
+speaker.wav

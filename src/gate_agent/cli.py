@@ -1,0 +1,483 @@
+"""The command line, and the module's STANDALONE face.
+
+    gate-agent monitor --config monitor.toml
+    gate-agent capture --config capture.toml
+    gate-agent agent   --config agent.toml
+
+**Three processes, beside each other.** The monitor watches whatever a site
+declares and tells a human what changed, and it opens nothing. The capture
+process photographs a lane on a timer and on that lane's events, writes to its
+own disk, and opens nothing. **The agent can ask a barrier to move where a site
+declared an act token or a relay**, and what THIS process can ask for is printed
+at every start by `opening_line`, derived from the configuration it loaded.
+They are separate processes for the reason every module
+in this project is separate: a partial failure must stay partial, and the one
+that has to still be alive when a lane is not should not share an interpreter
+with the one that is writing to a disk.
+
+**Standalone is a MODE, not a smaller product.** A monitor with no lane declared
+watches whatever IS declared -- a Vehicle ID service on its own, a platform on
+its own -- and says so. What it will not do is start with nothing declared: a
+monitor watching nothing reports "all fine", which is the one lie this module
+exists to prevent, so an empty target set is refused here with that reason
+printed.
+
+The line it prints on start says what it watches, what it can tell, and -- when
+`log` is the only sink -- that **nobody is paged**. That is a valid
+configuration and a deliberate one at a site whose logs are already collected;
+it is said out loud at the moment somebody starts the process rather than
+discovered the first time a lane goes down at midnight.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import threading
+from pathlib import Path
+
+from .agent import Agent, AudioMissing
+from .agent_service import AgentService
+from .agent_service import make_server as make_agent_server
+from .board import BoardTooSlow, check_pass
+from .capture import CaptureProcess, UnsupportedLaneContract
+from .capture_service import CaptureService
+from .capture_service import make_server as make_capture_server
+from .config import (
+    AgentConfig,
+    CaptureConfig,
+    ConfigError,
+    MonitorConfig,
+    opening_line,
+    read_secret_file,
+)
+from .monitor import Monitor, UnsupportedContract
+from .records import RecordUnwritable
+from .service import (
+    InsecureBind,
+    MonitorService,
+    assert_bind_allowed,
+    is_loopback,
+    make_server,
+)
+from .sinks import build as build_sink
+from .store import CaptureStore, StoreUnwritable
+from .ua import UaUnreachable, UaUnsupportedVersion
+from .ua_baresip import BaresipUa
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="gate-agent", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    monitor = sub.add_parser("monitor", help="watch the declared targets and tell a human")
+    monitor.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="the monitor's TOML configuration. Targets and sinks are DECLARED, never "
+             "defaulted, and a file that declares no target is refused here rather than "
+             "running as a monitor that reports nothing wrong about nothing",
+    )
+    monitor.add_argument("--host", default="127.0.0.1")
+    monitor.add_argument("--port", type=int, default=8092)
+    monitor.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="a file holding the shared token every route of this monitor's own surface must "
+             "carry. Required for any --host that is not loopback. A FILE and not a value, "
+             "because a value on the command line is readable by every user on the box for as "
+             "long as the process runs -- spelt the way vehicle-id and lane-controller spell it",
+    )
+
+    capture = sub.add_parser(
+        "capture", help="photograph the declared cameras, and keep what the rule allows"
+    )
+    capture.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="the capture process's TOML configuration. The directory and the size cap are "
+             "DECLARED, never defaulted -- one is where a site's photographs of cars are kept "
+             "and the other is that site's disk, and nothing in this package has measured "
+             "either",
+    )
+    capture.add_argument("--host", default="127.0.0.1")
+    capture.add_argument("--port", type=int, default=8093)
+    capture.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="a file holding the shared token every route of this process's own surface must "
+             "carry, INCLUDING the images. Required for any --host that is not loopback: off "
+             "loopback this surface serves photographs of cars and when they were taken",
+    )
+    agent = sub.add_parser(
+        "agent", help="answer the intercom, say what happened, and call a person"
+    )
+    agent.add_argument(
+        "--config",
+        type=Path,
+        required=True,
+        help="the agent's TOML configuration. Every intercom, every lane, both languages, "
+             "the person to call and what they may authorise are DECLARED -- there is no "
+             "default for any of them, because each one decides what somebody at a barrier "
+             "is told or what a person on a phone is allowed to say",
+    )
+    agent.add_argument("--host", default="127.0.0.1")
+    agent.add_argument("--port", type=int, default=8094)
+    agent.add_argument(
+        "--auth-token-file",
+        type=Path,
+        help="a file holding the shared token every route of this agent's own surface must "
+             "carry. Required for any --host that is not loopback: off loopback this "
+             "surface publishes which intercoms a site has and when nobody answered a call",
+    )
+    return parser
+
+
+def cmd_agent(args) -> int:
+    token = _token(args)
+    try:
+        assert_bind_allowed(args.host, args.port, token)
+    except InsecureBind as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    try:
+        config = AgentConfig.from_file(args.config)
+    except ConfigError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    ua = BaresipUa(
+        host=config.user_agent.host,
+        port=config.user_agent.port,
+        operator_aor=config.user_agent.operator_aor,
+        timeout=config.user_agent.timeout_seconds,
+        reconnect_seconds=config.user_agent.reconnect_seconds,
+    )
+    agent = Agent(config, ua)
+
+    reach = "local only by design" if is_loopback(args.host) else "EXPOSED"
+    print(f"gate-agent agent on http://{args.host}:{args.port}  ({reach})")
+    print(f"  site {config.site_id}, agent {config.agent_id}")
+    print(f"  answering: {', '.join(intercom.sip_uri for intercom in config.intercoms)}")
+    print(f"  languages: driver {', '.join(config.driver_languages)}; "
+          f"operator {config.operator_language}")
+    print(f"  calling:   {config.human_sip_uri}")
+    print("  may authorise: " + ", ".join(
+        value.value for value in sorted(config.authorisations, key=lambda one: one.value)
+    ))
+    if not any(intercom.lane for intercom in config.intercoms):
+        # Said at the moment somebody starts it, because "it answers the
+        # intercom" and "it reads a lane" are different facts and this is the
+        # configuration where they come apart. NOT a degraded mode.
+        print("  STANDALONE: no intercom has a lane, so every call is a human case")
+    print("  ONE CASE AT A TIME: a call arriving during a case is refused unanswered, "
+          "whoever it is from (486 Busy Here)")
+    print(f"  records:  {config.records.directory}"
+          f"{'' if config.records.declared else ' (the default)'}, kept "
+          f"{config.records.retention_days} day(s): every call, answered or refused")
+    print(opening_line(config))
+
+    try:
+        check_pass(AGENT_PASS_SECONDS)
+    except BoardTooSlow as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    try:
+        agent.start()
+    except AudioMissing as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    except UaUnsupportedVersion as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    except UaUnreachable as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    except RecordUnwritable as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    server = make_agent_server(
+        AgentService(agent), host=args.host, port=args.port, token=token
+    )
+    stop = threading.Event()
+    poller = threading.Thread(target=_agent_forever, args=(agent, stop), daemon=True)
+    poller.start()
+    _raise_on_sigterm()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stop.set()
+        # THE POLLER FIRST, so nothing redraws a screen after it is blanked: a
+        # poll in flight re-asserts a pending ticket's frame.
+        poller.join(timeout=2.0)
+        # **THE SCREENS GO BLACK, on every way out of this function.** The
+        # display module published "idle is a black frame, and so is exit" and
+        # nothing anywhere blanked one on exit: `SIGTERM` -- which is how a
+        # service manager stops this -- did not reach Python at all, so an
+        # ordinary `systemctl restart gate-agent` during a package upgrade left
+        # the last ticket on the screen. By the contract's own paragraph that
+        # code can never be vended, so the driver photographing it gets a human.
+        # The document treated that as the crash exception; it was what every
+        # restart did.
+        #
+        # BEFORE the socket and the user agent, and that ordering is the point:
+        # it is the only step here a driver at a barrier can see, and a failure
+        # in either of the others must not leave a code on a screen. It cost
+        # this test a red run to find out -- `ua.close()` raised, and the frame
+        # stayed up.
+        _blank_displays(config)
+        server.server_close()
+        ua.close()
+    return 0
+
+
+def _raise_on_sigterm() -> None:
+    """`SIGTERM` becomes the same exception `SIGINT` already raises.
+
+    One handler and one `finally`, rather than a second exit path that would
+    come to disagree with the first. Python's default for `SIGTERM` is to end
+    the process without unwinding anything, so the `finally` above never ran --
+    and it is the only thing that takes a code off a screen.
+    """
+
+    def stop(signum, frame):  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+
+
+def _blank_displays(config: AgentConfig) -> None:
+    """Every declared screen, black. Nothing here raises.
+
+    An exit path that raised would be a process dying differently depending on
+    which screen failed, and the screen is the thing being given up on anyway.
+    """
+    for name, display in sorted(config.displays.items()):
+        try:
+            display.blank()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).error(
+                "the display %s could not be blanked on exit: %s", name, exc
+            )
+
+
+#: How often the agent's loop passes. It turns the lane screens' boards
+#: (`board.Rotation`) as well as the dialogue, and is checked at start against
+#: a board item's turn (`board.check_pass`).
+AGENT_PASS_SECONDS = 0.2
+
+
+def _agent_forever(agent: Agent, stop: threading.Event, tick: float = AGENT_PASS_SECONDS) -> None:
+    """Advance the dialogue five times a second.
+
+    Faster than the other two processes' loops, and it is the one number here
+    that is about a person rather than a machine: this is the granularity of
+    every gap between one sentence and the next, and a driver at a barrier hears
+    a one-second loop as a system that has stopped working.
+    """
+    while not stop.wait(tick):
+        try:
+            agent.poll()
+        except Exception:  # noqa: BLE001
+            # An agent that dies is an intercom nobody answers. Anything a poll
+            # raises is logged and the loop continues; what it could not do is
+            # already on the health route.
+            logging.getLogger(__name__).exception("an agent poll raised; continuing")
+
+
+def _token(args) -> str | None:
+    """The shared token, THROUGH THE ONE GUARDED READER.
+
+    It used to read the file itself, which is how the one credential a person
+    passes on a command line was the one credential with no permission check on
+    it: an unreadable file, an empty file and a world-readable file were three
+    different outcomes and only two of them were refused.
+
+    `read_secret_file` refuses all three, names what this file is, and is the
+    only thing in this package that reads a credential off a disk.
+    """
+    if not args.auth_token_file:
+        return None
+    try:
+        return read_secret_file(str(args.auth_token_file), "--auth-token-file", None)
+    except ConfigError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
+def cmd_monitor(args) -> int:
+    # The bind refusal BEFORE anything is built or read, so a configuration no
+    # file would fix is reported in the moment.
+    token = _token(args)
+    try:
+        assert_bind_allowed(args.host, args.port, token)
+    except InsecureBind as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    try:
+        config = MonitorConfig.from_file(args.config)
+    except ConfigError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    sinks = [build_sink(sink) for sink in config.sinks]
+    monitor = Monitor(config, sinks)
+
+    reach = "local only by design" if is_loopback(args.host) else "EXPOSED"
+    print(f"gate-agent monitor on http://{args.host}:{args.port}  ({reach})")
+    print(f"  site {config.site_id}, monitor {config.monitor_id}")
+    print(f"  watching: {', '.join(target.name for target in config.targets)}")
+    print(f"  telling:  {', '.join(sink.name for sink in sinks)}")
+    if [sink.name for sink in sinks] == ["log"]:
+        # Said at the moment somebody starts it, because "the monitor is
+        # running" and "somebody will be told" are different facts and this is
+        # the configuration where they come apart.
+        print("  NOBODY IS PAGED: `log` is the only sink, so notifications go to stdout only")
+    print("  READ ONLY: this monitor has no route to a vend, here or at any target")
+    print(f"  records:  {config.records.directory}"
+          f"{'' if config.records.declared else ' (the default)'}, kept "
+          f"{config.records.retention_days} day(s): every message, whoever it reached")
+
+    try:
+        monitor.start()
+    except UnsupportedContract as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    except RecordUnwritable as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    server = make_server(MonitorService(monitor), host=args.host, port=args.port, token=token)
+    stop = threading.Event()
+    poller = threading.Thread(target=_poll_forever, args=(monitor, stop), daemon=True)
+    poller.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stop.set()
+        server.server_close()
+    return 0
+
+
+def _poll_forever(monitor: Monitor, stop: threading.Event, tick: float = 1.0) -> None:
+    """Ask the monitor to poll whatever is due, once a second.
+
+    The interval that matters is per target and lives in the configuration; this
+    is only how often the process wakes up to check whether one has elapsed. A
+    target polled every thirty seconds is not polled every second because of
+    this loop.
+    """
+    while not stop.wait(tick):
+        try:
+            monitor.poll()
+        except Exception:  # noqa: BLE001
+            # A monitor that dies is a monitor that reports nothing, which is
+            # the failure this module exists to prevent. Anything a poll raises
+            # is logged and the loop continues; what the poll could not measure
+            # is already `unknown` on the health route.
+            logging.getLogger(__name__).exception("a poll raised; continuing")
+
+
+def cmd_capture(args) -> int:
+    # The bind refusal BEFORE anything is built or read, so a configuration no
+    # file would fix is reported in the moment.
+    token = _token(args)
+    try:
+        assert_bind_allowed(args.host, args.port, token)
+    except InsecureBind as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    try:
+        config = CaptureConfig.from_file(args.config)
+    except ConfigError as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    store = CaptureStore(config.directory, config.retention_days, config.max_bytes)
+    process = CaptureProcess(config, store)
+
+    reach = "local only by design" if is_loopback(args.host) else "EXPOSED"
+    print(f"gate-agent capture on http://{args.host}:{args.port}  ({reach})")
+    print(f"  site {config.site_id}, capture {config.capture_id}")
+    print(f"  cameras:  {', '.join(camera.camera_id for camera in config.cameras)}")
+    print(f"  store:    {config.directory}")
+    print(f"  keeping:  {config.retention_days} day(s), then deleted")
+    if config.lane is None:
+        # Said at the moment somebody starts it, because "it is capturing" and
+        # "it captures when a car arrives" are different facts and this is the
+        # configuration where they come apart. It is NOT a degraded mode: a
+        # garage with a camera and no gate is a customer of this process.
+        print(
+            "  STANDALONE: no lane is declared, so captures are on the interval only. "
+            "Nothing here is triggered by a vehicle."
+        )
+    else:
+        print(f"  following: {config.lane.url} for arrivals and vends")
+    print("  READ ONLY: this process has no route to a vend, here or at the lane")
+
+    try:
+        process.start()
+    except StoreUnwritable as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+    except UnsupportedLaneContract as exc:
+        print(f"\n{exc}\n", file=sys.stderr)
+        return 2
+
+    server = make_capture_server(
+        CaptureService(process), host=args.host, port=args.port, token=token
+    )
+    stop = threading.Event()
+    poller = threading.Thread(target=_capture_forever, args=(process, stop), daemon=True)
+    poller.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        stop.set()
+        server.server_close()
+    return 0
+
+
+def _capture_forever(process: CaptureProcess, stop: threading.Event, tick: float = 1.0) -> None:
+    """Ask the process to do whatever is due, once a second.
+
+    The intervals that matter are in the configuration -- how often each camera
+    is photographed, and how often the lane's events are read. This is only how
+    often the process wakes up to check whether one has elapsed.
+    """
+    while not stop.wait(tick):
+        try:
+            process.poll()
+        except Exception:  # noqa: BLE001
+            # A capture process that dies is a process that records nothing,
+            # which is the failure the capture rule gives it the job of preventing.
+            # Anything a poll raises is logged and the loop continues; what it
+            # could not measure is already `unknown` on the health route.
+            logging.getLogger(__name__).exception("a capture poll raised; continuing")
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    args = build_parser().parse_args(argv)
+    return {"monitor": cmd_monitor, "capture": cmd_capture, "agent": cmd_agent}[
+        args.command
+    ](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

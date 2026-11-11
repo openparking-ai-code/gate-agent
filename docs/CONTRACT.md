@@ -1,0 +1,3333 @@
+# The gate agent contract
+
+This is the public surface of the two processes in this package — the
+**malfunction monitor** and the **capture process**. Everything else in the
+repository is an implementation detail that may be rewritten; this is not.
+
+They are **versioned together**, under one `contract_version`, so a consumer
+holds one compatibility policy for this package rather than two.
+
+Open Parking AI's own software integrates through exactly what is described
+here. There is no private path, no second mode and no in-process shortcut
+reserved for us — so if this contract is inadequate, we find out first.
+
+---
+
+## This monitor has NO OPENING AUTHORITY
+
+It reads `GET`s and it sends messages. It never calls a vend, never resolves a
+transit, never writes to a lane. The monitor holds no client capable of a
+method other than `GET`, and that is **swept out of the source and observed at
+the targets**, not promised here: `tests/test_no_opening_authority.py` walks
+every module for a request that is not a `GET`, and runs a whole poll against
+lanes that record what arrived.
+
+**Said of the MONITOR, and it used to be said of the package.** From contract version 2 the
+AGENT — the third process here, under this same `contract_version` — can command
+a vend at a lane a site gave it an act token for; see *IT CAN NOW COMMAND A
+VEND*. That sweep still walks every module: it exempts `act.py`, which only the
+agent uses, and the webhook sink, and nothing else — so a module this monitor
+reads a target through cannot grow a non-`GET` without going red.
+
+The one thing that leaves this process by any other method is a **webhook**,
+which points at a paging system and never at a lane. It lives in its own module,
+that module may not import the target client, and the sweep enforces both.
+
+Four routes, all `GET`. Every other method is answered `405` with `Allow: GET`.
+
+## Nothing this monitor opens follows a redirect
+
+**Every URL this process opens is one a human wrote in its configuration file,
+and a `Location` header does not change that.** A `3xx` is refused by the
+opener, in both directions — the read-only client and the webhook sink.
+
+It is stated here because following one is what a stdlib client does by default,
+and because of what that costs. A redirect rebuilds the request from the old
+one's headers, so **the bearer token travels with it**, to whatever host the
+payload names: a target could take this monitor's operator credential, serve its
+own payload as somebody else's health, and — pointing the webhook sink at a host
+of its choosing — make a POST that was never delivered report SUCCESS, so
+`sink_delivery_failed` never fired. This monitor is pointed at a third party's
+lane **by design**, so "the target is trusted" is not available.
+
+A 3xx from a target is therefore an ANSWER this monitor does not accept: it is
+`<kind>_refused_us` with `302` (or whichever) as its status. A 3xx from a
+webhook is `sink_delivery_failed`.
+
+## This monitor is a CONSUMER of the lane contract
+
+It reads a lane over
+[`lane-controller/docs/CONTRACT.md`](https://github.com/openparking-ai-code/lane-controller/blob/main/docs/CONTRACT.md)
+and imports nothing from that package — the same seat a third party takes. The
+test suite reads a real lane and a foreign one written from the document, through
+the same code, parametrised so neither can be special-cased.
+
+## Compatibility
+
+`contract_version` is `2`, and every payload carries it.
+
+**It went from 1 to 2 when the agent gained a vend route, and one change is why.** Everything added
+then is additive by the rule below — new fields, new event kinds, new codes —
+and none of that would have bumped it. `can_vend` did: it used to answer *"can
+anything in this package act"*, and the answer was `false` everywhere; it now
+answers *"does this agent hold what acting at THIS lane needs"*, per lane. A
+consumer reading the old meaning off the new payload would read a `true` as
+something this contract never said. **A field that changes MEANING is a version
+bump even when its type and its name do not move.**
+
+- **Additive changes do not bump it.** New fields may appear. Ignore fields you
+  do not recognise rather than rejecting the payload.
+- **Anything a consumer could notice bumps it** — a field removed, renamed, or
+  changed in meaning or type.
+- **An unrecognised version is refused, not partially read.**
+
+This is the same policy the [lane
+contract](https://github.com/openparking-ai-code/lane-controller/blob/main/docs/CONTRACT.md)
+and the Vehicle ID contract state, in the same words, so one consumer can hold
+one policy for all three. The Vehicle ID repository is not public.
+
+**The monitor applies that rule to what it reads, too.** A target answering with
+a version it does not know is refused at startup, by name, with both versions in
+the message. A target that changes version while the monitor is running raises
+`target_contract_unsupported` and **its codes stop being passed through** —
+half-understanding a payload about a lane is worse than admitting it cannot be
+read. A target that is merely DOWN at startup is not refused: that is a
+malfunction, not a misconfiguration, and refusing to start would mean being
+absent at exactly the moment a monitor is wanted.
+
+---
+
+## What it watches, and what it does with what it sees
+
+### Targets
+
+Each is per-site declared, each is optional, and **at least one is required**.
+An empty target set is refused at startup, named: a monitor watching nothing
+reports "all fine", which is the lie this module exists to prevent.
+
+| | |
+|---|---|
+| `lane` | A URL implementing the lane contract. The monitor reads `GET /v1/lane` once for identity and version, then polls `GET /v1/lane/health`. Ours or a third party's — there is no branch on which. |
+| `identity_service` | A Vehicle ID `GET /v1/health` URL. Unauthenticated by that contract's own decision: it carries no plate and no image, and a monitor holding the read credential in order to ask whether a process is alive is that credential in one more place. |
+| `platform` | The operator surface. Read with an **operator token from a file**, and its garage declared. |
+| `capture` | A capture process — this package's own second process, or anything implementing the capture half of this contract. The monitor reads `GET /v1/capture/health`, whose entries are in the **lane's shape on purpose**, so the same code reads both. This is how *"camera disconnected is a malfunction"* gets from a camera nobody can reach to a human who can go and look at it. |
+
+**Standalone is a MODE.** With no lane declared, the monitor watches whatever IS
+declared — a Vehicle ID service alone, a platform alone — and it is not a
+degraded configuration.
+
+**The poll interval is a per-site setting with a published default, one value
+per target.** It is also an **assumption**: nothing in this package measures how
+often a lane's health changes, or how quickly a human needs to hear.
+
+### Transitions, not states
+
+A monitor that sent the current state would send the same message every poll for
+as long as a fault lasted, and a human told a thousand times has been told
+nothing. So what gets sent is what CHANGED:
+
+| | |
+|---|---|
+| `raised` | `ok` or `unknown` became `active`. |
+| `recovered` | `active` became `ok`. |
+| `no_longer_measured` | `ok` or `active` became `unknown`. Sent **once**. Not a recovery and not a fault — the loss of a measurement, which is its own event and the one a monitor most easily hides. |
+| `still_active` | The state held and this site set a re-notify interval. |
+
+`unknown → ok` is deliberately silent: nothing was ever claimed about that code
+and now it is fine, and a message would train the reader to skim.
+
+**Nothing re-sends while a state holds** unless `[notify].renotify_seconds` is
+set. There is **no default** — a default interval would be a decision about how
+often to wake somebody, made for every site that never mentioned it. Only an
+`active` state repeats; a held `ok` is not news and a repeated recovery is not a
+fact about anything.
+
+### An HTTP answer is not silence
+
+A target that does not answer and a target that answers NO are two facts, and
+they name different machines:
+
+| | |
+|---|---|
+| `<kind>_unreachable` | Nothing came back. A network failure, a timeout, or a **5xx** — the target's process answered that it could not do the thing, and the repair is at that target either way. This is the "no connection" in the spec, and it is the monitor's own measurement because nothing else can make it: a thing that is down cannot report that it is down. |
+| `<kind>_refused_us` | It ANSWERED, and the answer was no — a **3xx** or a **4xx**. It is up, it received the request, and it declined it. |
+
+**Both carry the HTTP status**, on the health entry and in every sink's message,
+because the status is the difference between three repairs on three different
+machines: **401/403** is this monitor's own credential and the target is
+healthy; **404** is a route this build expects and that target does not have,
+which is what an OLDER target answers; **3xx** is a target trying to steer this
+monitor somewhere else. Folded into one code with no status, an expired token
+paged a human to a platform that was running perfectly, and they could not tell
+from the message either.
+
+Both are measured by this monitor, both follow the transition rule, and both are
+scoped per target. A poll that ends in silence leaves `<kind>_refused_us`
+**`unknown`** — nothing came back to refuse anything, and `ok` there would be a
+claim about a measurement nobody made.
+
+### `unknown` is never `ok`
+
+The states this surface publishes for a target are **that target's own, passed
+through**. Not re-derived, not re-labelled, not translated. A monitor that
+restated a lane's health in its own words would be a second copy of that lane's
+claim about itself, and the copy is the one that comes to disagree.
+
+So `unknown` arrives as `unknown`. The monitor **never pages on it and never
+hides it**: every unmeasured code with its `source` is on
+`GET /v1/monitor/health` continuously, and in one message at startup.
+
+**Those two are one enumeration.** The startup message is built from the same
+answer the health route serves, so the two cannot disagree — and they did: the
+message walked a different structure, and the codes it missed were exactly this
+monitor's own blind spots. With no platform declared, nobody is measuring
+whether a lane has gone quiet, and the one message whose purpose is *what does
+this monitor NOT know?* did not say so.
+
+### `never_alarm` is read from the payload
+
+Whether a code may wake a human travels on the wire with that code. This package
+holds **no list of its own**. If it did, the two would drift — and the drift
+shows up as a technician dispatched because a car arrived on low-texture ground,
+which is the failure the lane's caveat exists to prevent, reintroduced by its
+reader.
+
+### A payload this build cannot read is refused WHOLE
+
+Two fields on a lane's health entry are what this monitor acts on, and neither
+is guessed at:
+
+- **`never_alarm` must be a JSON boolean, on every entry.** Absent is not
+  `false`. Absent could be a lane with nothing to say or a lane whose serialiser
+  dropped the field, and the two point in opposite directions — one dispatches a
+  technician because a car arrived, the other silences a real fault. And a
+  string is not a boolean: every non-empty string is truthy, so `"false"` would
+  silence that code for ever with nothing anywhere reporting it.
+- **`state` must be one of `ok`, `active`, `unknown`.** A value outside the set
+  can never produce a transition, and it becomes the state a later one is
+  compared against — so an `active` fault arriving after one is held, published
+  as active, and told to nobody.
+
+Either one makes the whole payload one this build cannot read, and the answer is
+the answer this monitor already gives a version it cannot read:
+`target_contract_unsupported`, **`active`**, named, **paged once**, and that
+target's codes stop being passed through. Refused whole and not entry by entry,
+because passing through the rest would publish a partial view of a lane's health
+as though it were the whole.
+
+Validating a value against the set the contract defines is not re-deriving it.
+
+### The message
+
+It carries the site, the code, the transition, the `source` the target gave,
+that target's own `caveat` if it published one, the HTTP status when the code is
+about an answer, and the time.
+
+**`lane_id` is on a lane's notifications and on nobody else's.** `null` for the
+platform's codes, the identity service's, and this monitor's own — the sink that
+could not deliver and the target that could not be reached are not facts about a
+lane. `code=platform_unreachable … lane_id=lane-1` reads as "lane-1 cannot reach
+the platform", which is a different machine, a different fault and a different
+repair from the true one; and on the two codes spelt the same on both surfaces
+it puts a false discriminator beside the only true one.
+
+**It carries no plate, no image reference and no event detail.** The monitor
+reads `/health` — never `/events` and never `/state` — so it does not hold one,
+and the notification has nowhere to put one. That is swept over every sink's
+rendered output, with a planted plate as the control.
+
+---
+
+## `GET /v1/monitor` — who this monitor is, and what it watches
+
+<!--payload:monitor-->
+```json
+{
+  "monitor_id": "monitor-1",
+  "site_id": "site-1",
+  "contract_version": 2,
+  "event_window_depth": 256,
+  "retry_attempts": 3,
+  "retry_seconds": 60.0,
+  "record_retention_days": 400,
+  "record_max_bytes": 268435456,
+  "targets": [
+    {
+      "name": "lane",
+      "kind": "lane",
+      "url": "http://127.0.0.1:8090",
+      "poll_seconds": 30.0,
+      "authenticated": false,
+      "timeout_seconds": 10.0
+    }
+  ],
+  "sinks": [
+    {
+      "name": "log",
+      "kind": "log"
+    }
+  ]
+}
+```
+
+`url` is here because knowing WHAT is being watched is the whole value of this
+route, and a URL is not a credential. `authenticated` says whether one is
+configured; **the credential itself is on no route, and is not in this process's
+argument vector either** — every token is read from a file.
+
+**What is published is scheme, host, port and path, and nothing else** — rebuilt
+from those four parts rather than echoed as configured. A URL carries a
+credential very well (`https://ops:S3CRET@example.com`), and that one was
+accepted and republished here verbatim, beside `authenticated: false`, so the
+one field a consumer would use to notice read the wrong way. **Userinfo in a
+target or sink URL is now refused at startup, by name** — *credentials come from
+files* — and this route rebuilds the address anyway, because one check is a
+check and two is a boundary.
+
+`timeout_seconds` is how long this monitor waits for that target's answer. A
+per-site **setting** with a published default of **10 seconds**, and an
+**assumption** — nothing here measures how long a loaded Jetson takes to answer
+its own health route. What it is drawn against is the other side of the seam: a
+lane's health route may itself read a third machine (the identification service)
+and bounds that read at its own `[lane] identity_health_timeout_s`, published
+default 1 second. **This monitor's timeout must comfortably exceed that one.**
+If they cross, a lane that is up, serving, and correctly answering `unknown`
+about a hung identification service is published here as a DEAD LANE, and every
+real signal it publishes is retired at the same moment — a slow third machine,
+reported as a fault on the wrong one. The two numbers live in two repositories,
+so the relationship is stated in both contracts and measured in the test suite
+against a real lane that answers slowly.
+
+`event_window_depth` is how many notifications `GET /v1/monitor/events` can
+still serve behind the current cursor. Fall further behind than this and you are
+told **`reset`**, not served a short page — so a consumer's own catch-up policy
+depends on the number, which is why it is published here rather than described.
+It is `[monitor] event_window_depth`, a per-site setting with a published
+default, and it is an **assumption**: nothing here measures how far behind a
+consumer of that route falls. The lane contract publishes its own on
+`GET /v1/lane`, in the same field name, for the same reason.
+
+A sink is published as a name and a kind and **nothing else**. No host, no
+recipient, no URL. A consumer is entitled to know that somebody is being told;
+putting where they are on a read route would publish an address list. **Who
+received a particular message** is a different question with a different answer:
+it is on that message's record, on `GET /v1/monitor/messages`, behind the same
+credential — and nowhere else.
+
+`retry_attempts` and `retry_seconds` are how many more times a delivery that
+failed is tried and how far apart; `record_retention_days` and
+`record_max_bytes` are the bounds on the record of what was sent. All four are
+described under `GET /v1/monitor/messages`. The record directory is not
+published: it is a path on a box, and the records are read through the route.
+
+## `GET /v1/monitor/health` — its own codes, and every target's
+
+<!--payload:health-->
+```json
+{
+  "contract_version": 2,
+  "codes": [
+    {
+      "code": "lane_unreachable",
+      "subject": "lane",
+      "state": "ok",
+      "source": "measured",
+      "status": null
+    }
+  ],
+  "targets": [
+    {
+      "name": "lane",
+      "kind": "lane",
+      "polled_at": "2026-08-30T14:00:00+00:00",
+      "contract_version": 2,
+      "codes": [
+        {
+          "code": "reference_not_recognised",
+          "state": "unknown",
+          "source": "not_measured",
+          "never_alarm": true,
+          "caveat": "NOT an alarm. …"
+        }
+      ]
+    }
+  ],
+  "records": {
+    "held": null,
+    "bytes_used": null,
+    "max_bytes": 268435456,
+    "retention_days": 400,
+    "oldest_at": "2025-10-01T08:02:11+00:00",
+    "newest_at": "2026-10-30T22:15:05+00:00",
+    "cursor": 4117,
+    "purged_for_age": 0,
+    "dropped_for_space": 0,
+    "last_dropped_at": null,
+    "dropped_through": null,
+    "unreadable": 0,
+    "writable": true
+  }
+}
+```
+
+`held` and `bytes_used` are `null` in this example for the reason every size in
+the capture examples is: a figure in a document reads as measured, and how much a
+site's store holds is a read of that site's disk. Live, they are never `null`.
+
+`records` is the message-record store as READS, every count every time: how many
+records it holds and how many bytes, its two bounds, the oldest and newest
+record's time, the head `cursor`, how many records the age rule has deleted
+(`purged_for_age`) and how many the size rule has dropped oldest-first
+(`dropped_for_space`), when it last dropped one, and **`dropped_through` — the
+time of the newest record dropped for space, before which the account is not
+whole**. `unreadable` counts files in the directory this build could not read the
+age of; they are left, not deleted on a guess. `writable` is whether the last
+write succeeded; a write that fails is also `record_store_unwritable`, below, and
+the message it was about is still sent.
+
+### `codes` — the monitor's own
+
+One entry per `(code, subject)`. **Every member of `contract.MonitorCode` ships
+on every response**, and a payload missing one is refused when it is built,
+because a code that is absent reads to a consumer exactly like a code that is
+fine. A code with no subject yet ships once, `unknown`, under the monitor's own
+id.
+
+`subject` is what the code is about: which target could not be reached, which
+sink could not deliver, which device has gone quiet. It is part of the identity
+of the entry — "a sink failed" and "which sink failed" are different facts, and
+only one of them can be acted on.
+
+`status` is the HTTP status the target answered with, for the codes that exist
+because it answered — `<kind>_refused_us`. `null` on every other code. It is on
+the entry and not only in the message because a human arriving here after the
+message has scrolled away needs the same fact.
+
+**The set is published here, in full**, so that a paging system which is not ours
+can be written from this document alone. It used to say it did not list them, on
+the reasoning that a hand-written copy of a set the code defines is the copy that
+goes wrong — the same sentence the lane contract carried, and that reasoning is
+right. The conclusion was wrong: withholding the set does not remove the second
+copy, it moves it into every implementer's guess. So the copy is published and
+held to the enum by a test that compares every member in BOTH directions —
+dropping one here goes red, and so does adding one to `contract.MonitorCode`
+without adding it here.
+
+<!--payload:sets-->
+```json
+{
+  "monitor_codes": [
+    "lane_unreachable",
+    "identity_service_unreachable",
+    "platform_unreachable",
+    "capture_unreachable",
+    "agent_unreachable",
+    "lane_refused_us",
+    "identity_service_refused_us",
+    "platform_refused_us",
+    "capture_refused_us",
+    "agent_refused_us",
+    "target_contract_unsupported",
+    "sink_delivery_failed",
+    "record_store_unwritable",
+    "lane_gone_quiet"
+  ],
+  "capture_codes": [
+    "camera_unreachable",
+    "camera_refused_us",
+    "camera_feed_frozen",
+    "store_unwritable",
+    "store_over_budget",
+    "store_record_incomplete",
+    "clock_stepped_back",
+    "lane_unreachable",
+    "lane_refused_us",
+    "lane_contract_unsupported",
+    "lane_backlog_lost"
+  ],
+  "camera_unreachable_causes": [
+    "timeout",
+    "network",
+    "server_error",
+    "not_a_picture"
+  ],
+  "capture_reasons": [
+    "interval",
+    "lane_arrival",
+    "lane_vend"
+  ],
+  "retention_days_bounds": [
+    1,
+    3650
+  ],
+  "max_snapshot_bytes_default": 33554432,
+  "agent_codes": [
+    "sip_registration_lost",
+    "ua_unreachable",
+    "ua_unsupported_version",
+    "call_from_undeclared_intercom",
+    "human_unreachable",
+    "audio_missing",
+    "audio_playback_failed",
+    "lane_unavailable",
+    "display_unavailable",
+    "lane_act_refused",
+    "relay_unreachable",
+    "relay_refused_us",
+    "record_store_unwritable"
+  ],
+  "agent_cases": [
+    "malfunction_active",
+    "lane_closed",
+    "identification_unavailable",
+    "plate_not_read",
+    "plate_unclear",
+    "vehicle_not_recognised",
+    "rules_unavailable",
+    "entry_refused",
+    "vehicle_not_detected",
+    "entry_not_confirmed",
+    "stale_decision",
+    "unrecognised_reason",
+    "lane_unavailable",
+    "standalone",
+    "nothing_to_do"
+  ],
+  "authorisations": [
+    "open_now",
+    "open_and_flag",
+    "do_not_open",
+    "hold",
+    "transfer"
+  ],
+  "authorisation_digits": {
+    "1": "open_now",
+    "2": "open_and_flag",
+    "3": "do_not_open",
+    "4": "hold",
+    "5": "transfer"
+  },
+  "agent_event_kinds": [
+    "call_answered",
+    "case_spoken",
+    "human_called",
+    "authorisation_received",
+    "human_unreachable",
+    "nothing_usable",
+    "call_from_undeclared_intercom",
+    "call_refused_busy",
+    "case_not_spoken",
+    "call_ended",
+    "leftover_calls_released",
+    "ticket_issued",
+    "ticket_confirmed",
+    "ticket_voided",
+    "vend_commanded",
+    "vend_refused",
+    "relay_pulsed",
+    "relay_pulse_failed",
+    "ticket_on_screen",
+    "display_geometry_changed"
+  ],
+  "void_reasons": [
+    "window_elapsed",
+    "presence_lost",
+    "lane_decided_again",
+    "restarted",
+    "display_unavailable",
+    "lane_refused",
+    "lane_unreachable",
+    "act_refused",
+    "relay_failed",
+    "outcome_unknown",
+    "no_act_route",
+    "do_not_open"
+  ],
+  "shipped_languages": [
+    "en",
+    "es-ES"
+  ],
+  "message_kinds": [
+    "transition",
+    "unmeasured"
+  ],
+  "message_origins": [
+    "monitor",
+    "target"
+  ],
+  "message_target_kinds": [
+    "lane",
+    "identity_service",
+    "platform",
+    "capture",
+    "agent",
+    "monitor"
+  ],
+  "delivery_states": [
+    "pending",
+    "delivered",
+    "retrying",
+    "failed",
+    "interrupted",
+    "superseded"
+  ],
+  "delivery_results": [
+    "accepted",
+    "failed"
+  ],
+  "acknowledgements": [
+    "not_acknowledged"
+  ],
+  "call_dispositions": [
+    "answered",
+    "refused_busy",
+    "refused_undeclared"
+  ],
+  "call_outcomes": [
+    "authorisation_received",
+    "human_unreachable",
+    "nothing_usable",
+    "operator_hung_up",
+    "ticket_confirmed",
+    "told_ticket_on_screen",
+    "nothing_to_do",
+    "case_not_spoken",
+    "user_agent_lost",
+    "driver_hung_up",
+    "interrupted_by_restart"
+  ],
+  "record_query_keys": [
+    "since",
+    "lane",
+    "from",
+    "to",
+    "limit"
+  ],
+  "record_defaults": {
+    "directory": "/var/lib/openparking/gate-agent/records",
+    "retention_days": 400,
+    "max_bytes": 268435456,
+    "max_bytes_bounds": [
+      1048576,
+      17179869184
+    ],
+    "page_limit": 100,
+    "page_limit_max": 500,
+    "retry_attempts": 3,
+    "retry_attempts_bounds": [
+      0,
+      10
+    ],
+    "retry_seconds": 60.0,
+    "retry_seconds_bounds": [
+      1.0,
+      86400.0
+    ]
+  }
+}
+```
+
+The `message_*`, `delivery_*`, `acknowledgements`, `call_*` and `record_*`
+entries belong to the two record routes, `GET /v1/monitor/messages` and
+`GET /v1/agent/calls`, and are described there. `record_defaults` is every
+published default and bound those routes and their settings rest on, held to the
+constants by the same test.
+
+`record_store_unwritable` is on both lists, the monitor's and the agent's: the
+durable record of a message or a call could not be written. **The message is
+still sent and the call goes on** — a record store that could stop a page or
+refuse a driver would be worse than none — and the gap in the account is said,
+on the health route and to every sink, rather than found at the exception.
+
+`capture_codes`, `camera_unreachable_causes` and `capture_reasons` belong to the
+capture process and are described under its own routes below;
+`retention_days_bounds` is the range a site's `[capture] retention_days` must
+fall inside, and `max_snapshot_bytes_default` is the published default for
+`[capture] max_snapshot_bytes`. Every set here is held to the code by the same
+test, in both directions.
+
+**`max_snapshot_bytes_default` is a number in a document, and it is here rather
+than in an example for one reason: it is a CEILING ON A READ and not a claim
+about how big a picture is.** Nothing in this package has measured a capture
+from any of the cameras it is written for. This is the most it will read from
+one before it stops reading, it is a per-site setting, and startup refuses it
+unless it is BELOW `[capture] max_bytes` — see the retention rule below for why
+that bound is the one that matters.
+
+Two of the monitor's codes deserve saying out loud, because they are spelt the
+same as codes the LANE publishes and they are different facts:
+
+- `platform_unreachable` here is whether **this monitor** can reach the platform.
+  On a lane's health surface it is what **that lane** thinks of its own uplink.
+- `lane_gone_quiet` here is derived from the platform's
+  `lane_devices.last_seen_at`. On a lane's surface it is `not_measured`, and
+  necessarily so: a lane that has gone quiet is quiet, and the fault is only
+  visible from the other end.
+
+They are held in separate namespaces internally so that one can never be filed
+under the other, which would be a fault attributed to the wrong machine.
+
+### `targets` — passed through
+
+`codes` under a target is **that target's payload, unchanged**. Whatever entries
+it published, exactly as it published them, with the `state` and the `source` it
+gave. **`subject` is passed through when the target published one**, and the
+target's own name when it did not: a lane's codes are about the lane and carry
+none, while a capture process's are about a NAMED CAMERA — and a message saying a
+camera is dead without saying which is a message somebody has to go and work out
+at a site with four of them. `polled_at` is `null` until it has answered once, and `codes` is empty
+then — which is a different fact from a target that answered with nothing to
+say, and `<kind>_unreachable` is what separates them.
+
+`contract_version` is the version the TARGET declared. It is `null` for a target
+whose contract publishes no version — **the platform's operator surface does
+not**, so `target_contract_unsupported` for that target stays `unknown`: nothing
+was checked, and `ok` would be a claim about a measurement nobody made.
+
+### `lane_gone_quiet`, and the two clocks it spans
+
+A device the platform has not heard from for longer than
+`[targets.platform].lane_quiet_seconds` reads `active`. That threshold is a
+**per-site setting and an assumption**, and it is the more consequential of the
+two settings in this module: nothing here measures how often a healthy lane talks
+to its platform. A busy entry touches it on every vehicle; a quiet overnight exit
+may not for hours with nothing wrong.
+
+**The comparison spans two clocks** — the timestamp is the platform's and `now`
+is this monitor's — so a monitor whose clock is wrong reports lanes as quiet that
+are not. Stated rather than corrected: correcting it would mean measuring the
+offset, which is a second measurement nobody has made.
+
+A **revoked** device is skipped: a credential deliberately ended and then not
+seen is not a fault, and paging on it teaches whoever reads these messages to
+ignore them. A device that has **never** been seen is measured from when it was
+created — a credential issued a week ago and never used is a lane that never came
+up, which is exactly what is worth knowing at an installation.
+
+## `GET /v1/monitor/events?since=N` — what it told somebody
+
+<!--payload:events-->
+```json
+{
+  "contract_version": 2,
+  "cursor": 1,
+  "reset": false,
+  "dropped": 0,
+  "events": [
+    {
+      "cursor": 1,
+      "site_id": "site-1",
+      "lane_id": "lane-1",
+      "target": "lane",
+      "code": "outbox_depth_growing",
+      "subject": null,
+      "transition": "raised",
+      "source": "measured",
+      "caveat": null,
+      "at": "2026-08-30T14:00:00+00:00",
+      "status": null,
+      "record_id": "m-6c0e2b9f4a1d4e7f8a9b0c1d2e3f4a5b"
+    }
+  ]
+}
+```
+
+`record_id` is the id of this message's durable record on
+`GET /v1/monitor/messages`, and it is on **every copy of the message every sink
+is handed** — the webhook body, the log line, the email — the same on every
+attempt. A receiver handed a retry of something it already has drops it by this
+field. It is an additive field.
+
+Deliberately the same shape and the same semantics as the lane contract's
+`GET /v1/lane/events` and the Vehicle ID service's `GET /v1/reads?since=N`, field
+for field, so **one consumer can hold one cursor policy for three surfaces**.
+
+- The cursor is **monotonic within one run** and is **not durable across a
+  restart**. It is a catch-up window for a consumer that blinked, not a record of
+  anything; the durable record of what this monitor said is
+  `GET /v1/monitor/messages`, below. This route is unchanged by it, field for
+  field, so nothing that reads it breaks.
+- `since` ahead of this monitor's own cursor sets **`reset`**. An empty list
+  without that flag is indistinguishable from "nothing happened", which is how a
+  consumer silently misses everything after a restart.
+- `since` behind the oldest notification still held **also** sets `reset`. The
+  window is bounded, and a consumer further behind than that would otherwise
+  receive a page with the evicted notifications simply absent from it, which
+  looks exactly like a complete one.
+- `dropped` counts what the window has evicted. Published because a gap nobody
+  knows about is worse than one that is counted — and on this surface a gap is a
+  fault nobody was told about.
+
+**This route serves TRANSITIONS.** The one startup message saying what is not
+being measured is not one, and is not here: the same information is on
+`GET /v1/monitor/health` continuously, which is strictly better than one entry in
+a bounded window.
+
+## `GET /v1/monitor/messages` — every message it sent, kept
+
+The rule (decided 2026-10-30) for a car let out without paying: record it as an
+exception, with as much information as there is: what happened, who did what,
+when messages were sent and who received them; and record every message sent
+about a hardware or network failure. The platform builds the exception;
+this route is the half it reads from the monitor.
+
+**Every message this monitor sends is a record on this box's own disk.** Written
+before any sink is tried and written again with what each sink answered, so a
+crash between the two leaves a record whose delivery says it never finished —
+not no record. It exists **whatever the sinks are**: at a site whose only sink
+is `log`, a lane that cannot be reached is still a record, and its one delivery
+says nobody was configured to receive it (`recipients: []`,
+`recipient_configured: false`, and the record's `paged: false`). Transitions and
+the one startup message are both recorded; a transition on a code whose
+`never_alarm` is `true` is **not** — it was not sent, so there is no message to
+record, and its state is on the health route as it always was.
+
+**It survives a restart, and its cursor does.** The store is one JSON file per
+record in `[records] directory`, written atomically and synced; its index is
+rebuilt from the disk at every start.
+
+**Where it lives.** `[records] directory` has a published default,
+**`/var/lib/openparking/gate-agent/records`**, shared by the monitor and the
+agent. It is a default against this package's habit, for one reason: a monitor
+that refused to start for want of this line would page nobody. An undeclared
+directory therefore starts, with **one warning** naming where the records are;
+if even the default cannot be used the process still starts, with
+`record_store_unwritable` active, and tries again at every message. A
+**declared** directory that cannot be used refuses to start — somebody chose it,
+and it is wrong. Either way the directory is made **`0700`** at every start —
+tightened if it already existed wider, refused in words if it cannot be — and
+every file in it is **`0600`**. The monitor's and the agent's records may share
+it: every file is named for its kind (`m-…`/`c-…`, `head.messages.json`,
+`head.calls.json`), a start sweeps away only its own kind's half-written files,
+and each kind holds an exclusive lock file (`lock.messages`, `lock.calls`) for
+as long as its process runs. **A second process of the same kind on the same
+directory is refused at start**, naming the lock, on a declared directory and on
+the default alike. Every write — a new record, or a record
+that changed because a delivery was retried — takes the next **revision** from
+one counter persisted beside the records, so `since` means the same thing after
+a restart as before it, and a record that changed comes back under its new
+revision with the change in it.
+
+**Bounded, and the bound says so.** `[records] retention_days` (published
+default **400**, inside the same 1–3650 every retention here uses): a record
+older than that is deleted. `[records] max_bytes` (published default
+**268435456**, 256 MiB, a setting and an assumption — what is known is the size
+of a record, because this package writes it: under a kilobyte with one sink and
+about two with three, read off the records this suite writes; how many a site
+produces is not known): past it the **oldest go first**. Both are counted on
+`GET /v1/monitor/health` under `records`, with the time of the newest record
+dropped for space (`dropped_through`) — before that moment the account is not
+whole, and it says so rather than leaving it to be found.
+
+**A delivery that fails for a reason a moment can mend is tried again.**
+`[notify] retry_attempts` (published default **3**, bounds 0–10) more times,
+`[notify] retry_seconds` (default **60**, bounds 1–86400) apart. Transient is
+the network, a timeout, SMTP **4xx**, HTTP **5xx** and **429**. A refusal that
+would only be refused again — SMTP **5xx**, any other HTTP **4xx**, a redirect,
+an exception the sink did not name — is recorded `failed` at once and **not**
+retried. Every attempt is on the record with its time, the far end's answer and
+`transient`. This is not `renotify_seconds`, which repeats a message somebody
+received and has no default; this repeats one nobody received. The cost, stated:
+a sink that took a message and failed to say so — a webhook that took the POST
+and timed out answering — is told twice, and `record_id` on every payload is
+how its receiver drops the copy. A retry that succeeds is the sink coming back,
+and `sink_delivery_failed` for it recovers by the ordinary rule.
+
+**A retry never says an old fact after a new one.** When a retry falls due it is
+weighed first, and NOT sent — the delivery becomes **`superseded`** — when a
+later message about the same code (same origin, target, code and subject) has
+already reached that sink (`superseded_by` names its record), or when the code
+is no longer in the state the message announced: a `raised` while the code is
+`ok`, a `recovered` while it is `active` again (`superseded_by` is `null`). A
+`raised` delivered after its `recovered` reopens an incident on a pager; this is
+what stops it.
+
+**A retry survives a restart.** A delivery still `retrying` when the process
+stopped is resumed on its own schedule by the next run, after that run's first
+poll — so it is weighed against the state found then, and a `raised` for a fault
+that cleared while nothing was running is superseded rather than sent. A
+delivery still `pending` (the process died between writing the record and trying
+the sink, or in the attempt) is closed `interrupted`: nothing knows whether it
+reached anybody. So is the last run's startup message, if it was still being
+retried: this run's own says what is unmeasured now.
+
+**No acknowledgement exists in any sink this version, and the record says so.**
+SMTP carries none back, a webhook's 2xx is its receiver taking the request and
+not a person reading it, and a log line is read by whoever reads it. Every
+delivery is `acknowledgement: "not_acknowledged"` with `acknowledged_at` and
+`acknowledged_by` `null` — which means **nothing told us**, not that nobody
+read it. A sink that can carry one adds `acknowledged`, additively.
+
+**The recipient is on the record, and it is the only place an email address
+appears.** `recipients` is the recipient as configured: the email sink's
+addresses; the webhook's **host** — never its path or query, which commonly
+carry a token; nothing for `log`. It is on this route because "who received" is
+the question it answers. **No log line ever prints an email address**: a
+failure's reason is built from the server's code and words and reduced before
+anything can log it, and the startup line names sinks, never recipients.
+`GET /v1/monitor` still publishes a sink as a name and a kind and nothing else.
+
+### The query
+
+| parameter | |
+|---|---|
+| `since` | A revision. Records whose latest revision is after it. Digits only, at most `2^63-1`; default `0`. It is compared with a number and never touches a path. |
+| `lane` | A lane's own `lane_id`, as the lane publishes it on `GET /v1/lane`. **Matches that lane's records AND every record about no lane** (`lane_id: null`): a platform that cannot be reached, a sink that cannot deliver, a camera the capture process names, a monitor restarting — each is a fact about every lane at the site, and an exception about one lane is missing it otherwise. Every record says its `lane_id`, `null` included, so a consumer wanting one lane only drops the nulls. 1–128 printable characters. |
+| `from`, `to` | ISO 8601 **with a UTC offset** — a naive time is refused, not assumed. On the record's `at`. `from` inclusive, `to` exclusive, `from` before `to`. |
+| `limit` | 1–500, default 100. |
+
+Anything else — an unknown parameter, one given twice, a cursor that is not
+digits, a time without an offset, a query over 1024 characters — is **`400`
+with the reason**. A parameter spelt wrong and ignored would serve every lane's
+records to a consumer who believes it filtered them.
+
+`lane_id` on a record is known when the record is about a lane target and the
+monitor has read that lane's identity; a monitor that started while its lane was
+down has not, and its records about that lane say `null` until it restarts.
+
+### The page
+
+<!--payload:messages-->
+```json
+{
+  "contract_version": 2,
+  "cursor": 41,
+  "more": false,
+  "reset": false,
+  "gap": false,
+  "query": {
+    "since": 30,
+    "lane": "lane-1",
+    "from": "2026-10-30T21:00:00+00:00",
+    "to": "2026-10-30T23:00:00+00:00",
+    "limit": 100
+  },
+  "messages": [
+    {
+      "record_id": "m-3f9a0c1d2e4b5a6978c0d1e2f3a4b5c6",
+      "revision": 41,
+      "kind": "transition",
+      "site_id": "site-1",
+      "monitor_id": "monitor-1",
+      "lane_id": "lane-1",
+      "target": "lane",
+      "target_kind": "lane",
+      "code": "outbox_depth_growing",
+      "subject": null,
+      "origin": "target",
+      "transition": "raised",
+      "at": "2026-10-30T22:14:05+00:00",
+      "first_seen_at": "2026-10-30T22:14:05+00:00",
+      "cleared_at": null,
+      "source": "measured",
+      "caveat": null,
+      "status": null,
+      "paged": true,
+      "deliveries": [
+        {
+          "sink": "log",
+          "kind": "log",
+          "recipients": [],
+          "recipient_configured": false,
+          "state": "delivered",
+          "sent_at": "2026-10-30T22:14:05+00:00",
+          "delivered_at": "2026-10-30T22:14:05+00:00",
+          "next_attempt_at": null,
+          "attempts": [
+            {
+              "at": "2026-10-30T22:14:05+00:00",
+              "result": "accepted",
+              "reply_code": null,
+              "reply": null,
+              "http_status": null,
+              "reason": null,
+              "refused_recipients": [],
+              "transient": null
+            }
+          ],
+          "acknowledgement": "not_acknowledged",
+          "acknowledged_at": null,
+          "acknowledged_by": null,
+          "superseded_by": null
+        },
+        {
+          "sink": "email",
+          "kind": "email",
+          "recipients": ["night-desk@example.com"],
+          "recipient_configured": true,
+          "state": "delivered",
+          "sent_at": "2026-10-30T22:14:05+00:00",
+          "delivered_at": "2026-10-30T22:15:05+00:00",
+          "next_attempt_at": null,
+          "attempts": [
+            {
+              "at": "2026-10-30T22:14:05+00:00",
+              "result": "failed",
+              "reply_code": null,
+              "reply": null,
+              "http_status": null,
+              "reason": "email: Connection unexpectedly closed",
+              "refused_recipients": [],
+              "transient": true
+            },
+            {
+              "at": "2026-10-30T22:15:05+00:00",
+              "result": "accepted",
+              "reply_code": 250,
+              "reply": "2.0.0 Ok: queued as 4F2A9C01",
+              "http_status": null,
+              "reason": null,
+              "refused_recipients": [],
+              "transient": null
+            }
+          ],
+          "acknowledgement": "not_acknowledged",
+          "acknowledged_at": null,
+          "acknowledged_by": null,
+          "superseded_by": null
+        },
+        {
+          "sink": "webhook",
+          "kind": "webhook",
+          "recipients": ["paging.example.com"],
+          "recipient_configured": true,
+          "state": "delivered",
+          "sent_at": "2026-10-30T22:14:05+00:00",
+          "delivered_at": "2026-10-30T22:14:05+00:00",
+          "next_attempt_at": null,
+          "attempts": [
+            {
+              "at": "2026-10-30T22:14:05+00:00",
+              "result": "accepted",
+              "reply_code": null,
+              "reply": null,
+              "http_status": 204,
+              "reason": null,
+              "refused_recipients": [],
+              "transient": null
+            }
+          ],
+          "acknowledgement": "not_acknowledged",
+          "acknowledged_at": null,
+          "acknowledged_by": null,
+          "superseded_by": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `cursor` is what to send as `since` next: the last record's revision when
+  `more` is `true`, the store's head when it is not — so a consumer polling from
+  it hears about every later write, including a retry landing on an old record.
+- `reset`: `since` is ahead of this store's head. It is not the store that
+  cursor came from — a new disk, a wiped directory. Start again from 0.
+- `gap`: a record written after `since` was removed, for age or for space,
+  before it was served. This page is still good; carry on from `cursor`; the
+  account is not whole, and `records` on the health route counts what went.
+- `query` echoes the filter the page was cut with.
+
+**Every field of a record:**
+
+| field | |
+|---|---|
+| `record_id` | `m-` and 32 hex digits. Stable for the life of the record. |
+| `revision` | The store's counter at this record's latest write. |
+| `kind` | `transition`, or `unmeasured` for the one startup message. The webhook's own word for the same distinction. |
+| `site_id`, `monitor_id` | Who sent it. |
+| `lane_id` | The lane it is about, when it is about a lane target and the lane's identity was read. `null` otherwise — see the query. |
+| `target`, `target_kind` | What it is about: the declared target (`lane`, `identity_service`, `platform`, `capture`, `agent`), or this monitor itself (`monitor`: a sink that cannot deliver, the record store, the startup message). |
+| `code`, `subject` | The code and what it names — which camera, which sink, which device. `null` on the startup message. A camera's name, a card reader's or an intercom case's is the subject the target published, passed through. |
+| `origin` | `monitor` for this monitor's own measurement, `target` for a code a target published and this monitor passed through. Two codes are spelt the same on both sides and are different machines. |
+| `transition` | `raised`, `still_active` (still raised), `recovered` (cleared), `no_longer_measured`. `null` on the startup message. |
+| `at` | When the message was decided — the notification's own `at`. |
+| `first_seen_at` | When **this run** of the monitor first saw this episode `active`. A restart re-raises what is still active, so the earlier raise and the new one are two records and both are here. |
+| `cleared_at` | On a `recovered` only: when it cleared. A `no_longer_measured` is not a clearing. |
+| `source`, `caveat`, `status` | As the notification carries them. |
+| `paged` | Whether any delivery had a recipient configured. Derived. `false` is a message nobody was paged with. |
+| `deliveries[]` | One per sink, in the order the sinks are declared. |
+
+**Every field of a delivery and an attempt:**
+
+| field | |
+|---|---|
+| `sink`, `kind` | The sink's name and kind. |
+| `recipients` | As configured: email addresses, the webhook's host, nothing for `log`. |
+| `recipient_configured` | `false` exactly when `recipients` is empty. |
+| `state` | `pending` (written, not yet tried), `delivered`, `retrying` (failed for a transient reason; another attempt at `next_attempt_at`), `failed` (refused for good, or no attempt left), `interrupted` (the process stopped first), `superseded` (a retry not sent because it would have said an old fact after a new one). |
+| `superseded_by` | On `superseded`: the record of the later message that had already reached this sink, or `null` when what superseded it was the code's own state. `null` otherwise. |
+| `sent_at` | The first attempt. |
+| `delivered_at` | The attempt that was accepted. |
+| `next_attempt_at` | While `retrying`. |
+| `attempts[].result` | `accepted` or `failed`. |
+| `attempts[].reply_code`, `reply` | The SMTP server's answer to the message — the one the library raises on unless it is 250 — and its text, which is where a mail server puts the queue id somebody can find the message by. A refusal's code is here too. `null` where there was no SMTP answer. |
+| `attempts[].http_status` | The webhook receiver's status, accepted or not. |
+| `attempts[].reason` | A failure's plain reason, **never carrying an email address**. |
+| `attempts[].transient` | On a failure, whether it was one worth trying again (see above). `null` on an accepted attempt. |
+| `attempts[].refused_recipients` | Recipients an SMTP server refused while accepting the message for the rest — a partial acceptance is still somebody who was not told. |
+| `acknowledgement`, `acknowledged_at`, `acknowledged_by` | `not_acknowledged`, `null`, `null` — see above. |
+
+**This route is a READ.** The store behind it is written by the poller and by
+nothing a caller can reach; the parameters are parsed by one function that
+refuses what it does not recognise. Off loopback the credential is required here
+as on every other route, and the reason is sharper than on the others: this one
+carries the addresses a site pages.
+
+---
+
+## How a human is told
+
+A closed set this version: `log`, `email`, `webhook`. **SMS is a later round's
+provider and is deliberately absent** — the set being closed and published is
+what makes adding one an additive change rather than a configuration key that
+quietly already works.
+
+| | |
+|---|---|
+| `log` | Structured JSON to stdout, one line per notification. **Always on**, and the one sink that needs no provider, no credential and no network. |
+| `email` | SMTP, per-site host, port, from and to, **TLS by default**. |
+| `webhook` | A `POST` of the notification object to a per-site URL with a bearer token from a file. This is how a third party's paging system takes the seat. |
+
+**Every sink is per-site declared and none has a default recipient.** A default
+recipient pages somebody who never asked, or — far more likely — a placeholder
+nobody reads, while the site believes it is covered.
+
+**A site with only `log` declared is valid, and it means NOBODY IS PAGED.** The
+notifications go to this process's stdout and to whatever collects it. That is a
+real configuration where the logs are already watched, and the process says so on
+the line it prints when it starts.
+
+**There is no SMTP credential in this version**, and that is stated rather than
+left to be discovered: a credential is a file and a decision about which file,
+and nobody has made it. A site needing an authenticated relay finds out at
+startup rather than after a fortnight of rejected alerts.
+
+**A sink that fails to deliver is itself a monitor code.** `sink_delivery_failed`
+is reported per sink on the health route and told to **every other sink that
+works** — never wrong silently applies to the messenger too, and a paging system
+nobody can reach is the failure that hides every other failure. A failure while
+reporting a failure is recorded and told to nobody, so one dead endpoint cannot
+become a loop.
+
+## Running it
+
+```sh
+gate-agent monitor --config monitor.toml
+```
+
+Binds `127.0.0.1:8092`. **Local by design** — this is meant to run beside the
+lane it watches.
+
+**`[records] directory` may be declared, and has a published default** — see
+`GET /v1/monitor/messages`. A declared directory that cannot be used refuses to
+start; an undeclared one never stops the monitor, because a monitor that does
+not start pages nobody. The directory is made `0700` and every record file
+`0600` — they hold the addresses a site pages.
+
+**Off loopback it refuses to start without a credential.** `--host` anything but
+loopback requires `--auth-token-file`, and with a token every route requires
+`Authorization: Bearer <token>` and answers `401` without it. The exposure that
+rule exists for is its own kind: this surface does not publish where a vehicle
+was, it publishes which of a site's lanes are broken, which cameras are dark and
+when nobody was told — which is a map for whoever wants to arrive while the
+equipment that would have noticed is down.
+
+**Every token is read from a FILE, never from a value.** A value on the command
+line is readable by every user on the box for as long as the process runs; a
+value in a configuration file is a credential in that file, in every backup of it
+and in everything anyone ever pastes it into. A configuration key that would hold
+one is **refused by name**, with the name of the file key that replaces it.
+
+There is no flag that turns any of that off.
+
+## What is NOT here, stated rather than left to be discovered
+
+- **No act surface.** No vend, no resolve, no route that changes anything, here
+  or at a target.
+- **No state store for what it is WATCHING.** Every code's state is lost on a
+  restart, and the startup message says what it does not yet know rather than
+  reporting the last thing it happened to remember. What it SENT is kept — see
+  `GET /v1/monitor/messages` — and a message record is not read back as a state:
+  the record of a fault raised yesterday is not evidence the fault is active
+  now. **A restart therefore re-sends `raised` for
+  every code that is still active**, because every code starts `unknown` and a
+  code seen for the first time as `active` is a transition into a fault. That is
+  deliberate — a monitor that started while a lane was already broken must say
+  so — and it is stated here rather than left to be worked out from the
+  transition table plus the absence of a store.
+- **No SMS**, no SIP, no audio, no DTMF. The agent that answers a driver at the
+  barrier is a later round in this same repository.
+- **No SMTP credential.** See above.
+- **No acknowledgement from any sink**, so no message record says one arrived:
+  every delivery is `not_acknowledged`, which means nothing told us.
+- **`identity_service_degraded` is not read from the identity target.** That
+  service publishes `status: degraded` when a read was lost or its queue held a
+  line it could not read, and the LANE reads it — it reaches this surface as a
+  passed-through lane code. A monitor with an identity service declared and **no
+  lane** therefore does not see degradation. That is a gap, and it is named here
+  rather than filled by a second observer of one field.
+- **No aggregation.** "N in a row is a fault" needs an N, and nobody has measured
+  one. The codes that need it stay `not_measured` at the lane and arrive here
+  saying so.
+
+---
+
+# The capture process
+
+`gate-agent capture --config capture.toml`
+
+The rule: the camera captures an image every minute and every time the gate
+opens, a disconnected camera is a malfunction, and the pictures of the cars are
+saved. On what a broken barrier changes: **the
+camera's job changes from DECIDING to RECORDING** — capture every entry,
+timestamp and image so the entries can be reconstructed. Before this existed,
+nothing in this estate kept an image anywhere: a lane grabs frames at an arrival,
+hands them to the identifier, and drops them.
+
+## It has NO OPENING AUTHORITY either
+
+It reads a camera and it reads a lane's READ contract, both `GET`, and it writes
+to its own directory. **This process holds no client capable of a method other
+than `GET`** — said of the capture process, not of the package, since the
+agent gained a vend route — swept out of the source and observed at the lane
+and at the camera. It has no route that changes anything: it cannot capture on
+demand, it cannot delete a record, and it cannot move a retention window.
+
+**The lane is not touched by this process at all.** It learns that a car arrived
+and that the lane vended from `GET /v1/lane/events?since=` — the read contract,
+which is the seat a third party takes. A store the lane had to `POST` into would
+make the lane's vend path depend on a process that need not exist, and that vend
+path is the boundary every outside reviewer of this project has named.
+
+**And that seat costs something, which is MEASURED rather than described.** This
+process learns about an arrival by POLLING, so the picture is taken when the
+event was SEEN, not when the frames were grabbed. Every lane-triggered record
+carries `capture_minus_lane_event_ms`, which is that subtraction, on that record,
+at that site. A sentence here could only describe one installation — and what
+that number spans, which is two machines' clocks, is stated under the records
+route below.
+
+**A LANE THIS PROCESS DID NOT WRITE IS THE DESIGNED CASE, NOT THE EXOTIC ONE.**
+That is the whole point of the seat. So a page this build cannot read is refused
+WHOLE, and said out loud: see "When a lane breaks its own contract" below.
+
+## Nothing it stores identifies a vehicle
+
+Not a plate, not a plate region, not a colour, not a make — and **not a lane
+event's `detail`**, which is where a lane puts what it knows and where
+`entry_pending` really does carry `plate_region`. What a record carries about its
+trigger is the event's **cursor** and the time **the lane** recorded, which is a
+reference and not a copy.
+
+The join to who the car was therefore lives in exactly two places and neither is
+here: the lane's platform holds the durable record under that cursor, and this
+store holds the image. A plate in this directory would be a second copy of an
+identity, on a box in a gate housing, outside every retention mechanism that
+already exists for one.
+
+This is swept over every route and over every byte in the store, with a plate
+planted in a lane event's `detail` as the positive control.
+
+## The two triggers
+
+| | |
+|---|---|
+| `interval` | The clock. `[capture] interval_seconds` elapsed. Every minute, as a per-site setting with that as its published default — and an **assumption**: nothing here measures what a garage needs to reconstruct. |
+| `lane_arrival` | The lane recorded `frames_captured`: a vehicle presented and it grabbed frames for it. |
+| `lane_vend` | The lane recorded `vended`. This is every time the gate opens, in the only phrasing that is measurable — **nothing anywhere knows whether the boom moved.** A lane's vend output has one method, no feedback and no `close()`, by design, and boom-as-marker is unbuilt. |
+
+`entry_pending` is **not** a trigger. It arrives after `vended`, so it would
+photograph the same vehicle twice, and it carries `plate_region` in its `detail`
+— which this process does not read, from any event.
+
+**Standalone is a MODE.** With no lane declared the process takes interval
+captures only and **says so on the line it prints when it starts**. That is not a
+degraded configuration: a garage with a camera and no gate is a customer of this
+process.
+
+**A lane that is DOWN is not a reason to stop.** `lane_unreachable` goes active,
+the interval captures continue, and that is precisely the job the capture rule gives
+this process — the camera records because the barrier cannot be trusted.
+
+**On start it takes the lane's place at the current cursor** and photographs
+nothing for what is already in that lane's window. Those cars have gone; a
+picture taken now and filed against one of their events would be an image of an
+empty lane carrying a reference to a vehicle, which reads as a record *of* that
+vehicle.
+
+### When a lane breaks its own contract, and when it merely loses a backlog
+
+Two different facts, two codes, and neither of them is a log line on a box.
+
+**`lane_backlog_lost`** — the lane answered `reset`: it restarted, or it evicted
+further than this process had fallen behind. This process takes its place at the
+new cursor and photographs nothing for the gap, for the same reason as the first
+read. **What was in that gap can never be photographed** — those cars have gone
+— so it is `active` until the next page that is not a reset, and
+`lane_events_missed` on the health route counts how many events that was, since
+this process started. The capture mode exists so the entries can be
+reconstructed, and the busiest hour is exactly the hour that outruns a window: a
+gap nobody knows about is worse than one that is counted, which is the same
+sentence `dropped` exists for.
+
+**`lane_contract_unsupported`** — the lane served a page this build cannot read.
+**The page is refused WHOLE**: the cursor is NOT adopted, nothing is photographed
+under a lane reason, and the next poll asks for the same events again — so it
+recovers by itself the moment the lane serves a page that can be read. It is the
+same answer, in the same shape, as the monitor's `target_contract_unsupported`.
+
+A page is refused when:
+
+| | |
+|---|---|
+| `occurred_at` **carries no UTC offset** | It is not a moment this process can subtract from its own — two machines, two timezones — and a capture filed under a lane reason with its reference dropped is a record this package's own contract refuses to publish. |
+| `occurred_at` is absent, is not a string, or is not a timestamp | Same fact, one step earlier. |
+| a triggering event carries **no cursor** | The cursor IS the join to who the car was. A capture with no reference filed under a lane reason is the same refused record. |
+| the page's `cursor` **went backwards** with `reset: false` | The lane contract says the cursor is monotonic within a run and that a restart sets `reset`. Adopting a backwards cursor re-serves the same events on the next poll and photographs them **again**, for ever — and every duplicate consumes `max_bytes`, so the size rule then evicts real captures to make room for them. |
+| the page carries no `cursor`, or no `events` list | There is nothing here to follow. |
+
+An event of a kind this build does not trigger on is **not** a contract break: a
+lane gaining an event kind is the ordinary case, and this contract says a
+consumer ignores what it does not recognise.
+
+## The camera
+
+**One real implementation this version: an HTTP JPEG snapshot.** A `GET` of a URL
+that answers `image/jpeg`, with the credential presented through **standard HTTP
+authentication** — the challenge-response the camera itself asks for when it
+answers `401`. Both Basic and Digest are answered; which one is used is the
+camera's choice, because a client that decided for itself would need a per-camera
+setting nobody can answer correctly.
+
+**There is no RTSP**, and that is a decision rather than a gap: reading a stream
+needs a decoder, and this package has no dependencies at all — it runs on a box
+in a gate housing where every dependency is one more thing to cross-compile,
+patch and have go wrong with no keyboard attached.
+
+**`[cameras.<id>] timeout_seconds` IS A DEADLINE ON THE WHOLE READ, not a socket
+option.** A camera that answers, declares a length and then sends one byte every
+quarter second never trips a per-operation timeout, because no single read waits
+long enough. This process runs ONE poller thread, so such a camera would hold
+every other camera's interval capture and the lane's event poll behind it, for as
+long as it chose, with nothing going `active`. The body is therefore read in
+chunks against a wall of `timeout_seconds` from the moment the request went out,
+and past it the read is abandoned: `camera_unreachable` with a `cause` of
+`timeout`. **One camera cannot hold this process for longer than that camera's
+own timeout.**
+
+**`[capture] max_snapshot_bytes` is the most this process reads from one camera**
+— a per-site setting whose published default is in the closed sets above, and a
+CEILING ON A READ rather than a claim about how big a picture is. **Startup
+refuses it unless it is below `[capture] max_bytes`**, and that bound is the
+point of the setting: the store evicts to make room for what arrives, so a
+ceiling at or above the whole cap would let one camera's answer decide how much
+of a site's store survives — and how long that answer is, is the camera's to
+choose.
+
+**A credential never goes in the URL.** `[cameras.<id>].snapshot_url` carrying
+userinfo is refused at startup, by name, by the same code that refuses it in a
+target or a sink URL — and the address is REBUILT from scheme, host, port and
+path before it is published, so a query string cannot carry one out either.
+
+### Cameras this build does not support, and why
+
+**A camera whose documented snapshot API takes the credential as a QUERY
+PARAMETER is not supported by this build.** It is not made to work by writing a
+password into a configuration file, every backup of that file, and every access
+log, proxy log and browser history between this process and the camera.
+
+Of the two default-tier cameras the lane's reference-hardware note names:
+
+| | |
+|---|---|
+| **AXIS P1465-LE** | **Supported.** Its snapshot route is `GET /axis-cgi/jpg/image.cgi`, and VAPIX authenticates with HTTP Basic or Digest — headers, never a query string. |
+| **Reolink RLC-810A** | **NOT SUPPORTED by this build.** Reolink's own support documentation gives the snapshot route as `/cgi-bin/api.cgi?cmd=Snap&…&user=…&password=…` — the credential is a query parameter, and its token alternative is a query parameter too. There is no documented header-authenticated snapshot route to use instead. A site with these cameras needs either a camera that authenticates in a header, or a later round that decides deliberately to accept a credential in a URL. This build does not decide that quietly. |
+
+**Neither claim is a measurement.** Nobody here has one of these devices. Each is
+a claim about a document, and the receipt for this round names the document, the
+URL and the date it was read.
+
+### What a failed read is called
+
+The same split the monitor makes for a target, because it is the same fact:
+
+| | |
+|---|---|
+| `camera_unreachable` | Nothing came back — a network failure, a timeout, a **5xx**, or a body that does not begin as a JPEG. This is *"camera disconnected is a malfunction"*. It carries a **`cause`** out of `camera_unreachable_causes`: one fact to this process, four different repairs to the person sent to fix it. `null` until it has been measured. |
+| `camera_refused_us` | It ANSWERED, and the answer was no — a **3xx** or a **4xx**, with its status on the entry. **401** is the credential in the file beside this process and the camera is fine; **404** is a snapshot route this camera does not have; **3xx** is a camera steering this process somewhere else, which is refused rather than followed. |
+
+A body that is not a JPEG is refused rather than stored: a login page served as
+`image/jpeg` fills a store with documents that read as a working installation
+right up until somebody opens one.
+
+The four causes, in full:
+
+| | |
+|---|---|
+| `timeout` | The deadline passed. The body was still arriving, or was not arriving at all, and this process stopped reading. |
+| `network` | The socket failed, or nothing answered on it. |
+| `server_error` | A **5xx**: the camera's own process answered that it could not take the picture. The repair is at the camera either way, which is why it is here and not under `camera_refused_us`. |
+| `not_a_picture` | Something came back and it was not a JPEG, or it was longer than `[capture] max_snapshot_bytes`. |
+
+**Nothing this process opens follows a redirect**, in either direction and for
+both the camera and the lane. It matters most at the camera: the retry is the
+request that carries `Authorization`, so a camera answering `302` to it would
+hand a site's camera password to whichever host it named.
+
+## The store
+
+**One record is two files**, under `[capture] directory`:
+
+- **the JPEG exactly as the camera sent it**, never re-encoded — so the size
+  measured is the camera's and not this package's;
+- **a sidecar** of `captured_at`, `camera_id`, `reason`, `lane_event_cursor`,
+  `lane_event_at`, `lane_event_id`, `capture_minus_lane_event_ms` and `bytes`.
+  Eight fields, and there is no ninth.
+
+**`lane_event_id` is the durable half of the join.** The cursor is what this
+process polled the lane by, and the lane contract says it is **not durable
+across a restart** — so a record joined by the cursor alone stops naming
+anything the day the lane restarts. `event_id` is the lane's own id for that
+event, the key its platform keeps the event under, and it survives. It is
+carried when the lane's page carries one; a lane that publishes no `event_id`
+is still photographed, with the field `null`.
+
+**The sidecar carries no version number, and that decides how a field is
+added.** The reader judges a sidecar by which fields are present. Every record
+written before `lane_event_id` existed carries the seven fields it had then,
+and a reader that REQUIRED the eighth would find every such record incomplete
+and delete it — JPEG and sidecar — at the next start, on every box, counted
+`store_record_incomplete`. So the seven are required, `lane_event_id` is read
+with `.get`, and such a record is served with it `null`. Additive-optional, or
+it purges a site's whole store on restart. The same rule binds any field added
+after this one.
+
+**A record's name is a timestamp, the camera id and a sequence number, and
+nothing else.** A directory listing is readable by anyone who can read the
+directory, and a filename is the one part of a file that survives being copied
+somewhere with no context.
+
+**Written atomically.** Both files are written under temporary names in the same
+directory and then renamed.
+
+**A crash before the first rename leaves no record — AND NO IMAGE.** Those
+temporary files hold the JPEG. Left on the disk they are outside the index,
+outside `bytes_used`, outside every report, and outside the retention rule
+itself, because that rule reads a sidecar and there is none to read: a
+photograph of a car, kept for ever, on a box in a gate housing. So both halves
+are closed. **A live write removes its own temporary files in a `finally`** —
+whatever ended it. And **every temporary file the next index rebuild finds is
+removed and COUNTED** as `purged_by_crash`: nothing but a crash can leave one,
+because this process is the only writer of this directory and a live write
+cleans up after itself. The count is published because how often a site loses
+power mid-write is a fact about that site.
+
+The window this cannot close is **one `rename` wide** — between the image's and
+the sidecar's — and a crash inside it leaves an image with no sidecar, which is
+**reported and purged, never silently kept**. Closing it would need a filesystem
+that renames two names at once, so it is named here rather than claimed away.
+
+**A record is BUILT THROUGH THE CONTRACT before anything touches the disk.** The
+class `GET /v1/capture/records` builds its page from is the class the write is
+validated by, so there is no second opinion to drift: **a record this process
+could not publish is a record it does not file**, and the poll that produced it
+is refused. Without that, a lane page this build half-accepted could leave a file
+on a disk that makes the records route raise for every consumer until it aged
+out — up to `retention_days`, with the health route saying `ok` throughout.
+
+**The index is rebuilt by reading the directory, every start. A check, never a
+memory.** There is no manifest to go stale and no counter to be wrong, and a file
+somebody deleted by hand is simply not in the index. It is also how the three
+kinds of half record are found: an image with no sidecar, a sidecar with no
+image, and a sidecar **the contract will not accept** — one that will not parse,
+one missing a field, or one carrying a combination this process would not have
+written. All three are `store_record_incomplete`, and all three are deleted — a
+half record is a photograph nobody can say anything about, sitting under a
+retention rule that **cannot reach it**, because the rule reads the sidecar.
+
+**And `GET /v1/capture/records` never dies on what it finds.** A record it cannot
+publish is reported and purged on the spot rather than raised: a route that
+raised would answer nothing, for every consumer, until that one record aged out.
+
+**One process per directory.** Two capture processes sharing one store would each
+rebuild an index the other is writing into, and the size cap would be enforced
+twice against one disk. Stated rather than locked.
+
+## The retention rule, and a purge that DELETES
+
+`[capture] retention_days` — a per-site setting, published default and bounds in
+the closed sets above. **That window and those bounds are the platform's identity
+retention window and bounds**, chosen once for personal data at rest in
+this estate: a stored photograph of a car at a barrier is personal data in most
+places this installs, so it gets the same answer rather than a second one. The
+**single copy of the default is `config.DEFAULT_RETENTION_DAYS`**, published into
+this document by the payload mechanism below and held to it by a value test —
+editing the document goes red, and so does editing the constant. The platform
+keeps its copy in a database column and nowhere else; a lane has no database and
+this process has no column, so this is where the one copy lives.
+
+`[capture] max_bytes` — **DECLARED, no default, refused at startup if absent.**
+Nothing in this package has ever seen a capture from any of the cameras it is
+written for, so there is no measurement here to draw a default from, and a
+plausible number would be a figure that looked measured.
+
+`[capture] directory` — **DECLARED, no default**, and refused at startup if it is
+not there or will not take a write. It is **not created**: a path that is not
+there is a typo or a disk that did not mount, and creating it would put a site's
+captures on the root filesystem of the box the lane runs on. Writability is asked
+of the **disk** — a byte written and deleted — because the permission bits answer
+for the wrong thing on a read-only mount, a full disk and a directory with an
+ACL.
+
+**The purge runs at startup and around every write. Age first, then size.** A
+record older than the window goes because it is old, whatever the disk has room
+for; the cap is then applied to what is left, oldest first. Reversing them would
+let a large recent day evict a record the retention rule was still keeping
+deliberately, which is a window nobody can state.
+
+**A capture that cannot fit is refused BEFORE anything is purged.** `len(image)`
+is checked against `max_bytes` first, and **nothing is deleted** — because no
+amount of deleting makes room for a capture larger than the whole cap, so a purge
+run for one destroys a site's store to make room for a write that is then refused
+anyway. The size rule also evicts **only what THIS capture needs**: it is bounded
+by that headroom and is never "while there is anything left", which is the same
+defect one level down.
+
+**Oldest is by VALUE, not by position.** The index is in insertion order, and a
+clock that steps back writes an earlier record after a later one — so "oldest
+first" read off the front of a list is whatever happened to be written first.
+`oldest_at` and `newest_at` are the minimum and maximum of `captured_at` for the
+same reason.
+
+### `clock_stepped_back`, and what it suspends
+
+**A record stamped after the clock that reads it is not deleted early and is not
+ignored: it is named.** `clock_stepped_back` is measured on every purge, as
+`newest_at` later than `now`, and is `active` for as long as that holds.
+
+**While it is active the AGE rule is suspended for those records** — a record
+stamped later than now is not older than any window, so the retention rule
+cannot reach it — **and the size rule is the only bound on them.** That is stated
+rather than corrected: this process cannot know which of the two readings is the
+right one, and deleting a record because a clock moved is exactly the failure a
+retention window exists to prevent.
+
+**One clock is not a monotonic one.** This package reads every moment — the stamp
+on a record, the window it is measured against, the projection — from a single
+callable, and that is worth having; it is not a fix for a clock that steps. A box
+in a gate housing with no RTC battery, which is the environment this package
+names for itself, is corrected by NTP after it comes up.
+
+**It DELETES, and that differs from what the platform does on purpose.** The
+platform's identity retention nulls a vehicle's attributes and keeps the row,
+because the row is a foreign key and a money record hangs off it. Here there is
+no foreign key and no money record: **the image IS the datum**, and a retention
+rule that kept it would not be one.
+
+**Every purge is a log line and a counter on the health route** —
+`purged_by_age` and `purged_by_size` — so a store that is silently eating itself
+because the cap is too small is visible rather than quiet.
+
+`store_over_budget` is what is left when the rule cannot work: a single capture
+is larger than the whole cap, or one purge could not get under it. The write is
+**refused and named** rather than dropped — a store that quietly discarded what it
+could not fit would be a recording missing exactly the busiest hour.
+
+A correctly configured process cannot reach it, and that is deliberate:
+`max_snapshot_bytes` is refused at startup unless it is below `max_bytes`, so
+nothing a camera can answer with is larger than this store can hold. It remains
+the store's own refusal, so that a caller handing it more is told rather than
+obeyed.
+
+## `GET /v1/capture` — who this process is, and what it is set to do
+
+<!--payload:capture-->
+```json
+{
+  "capture_id": "capture-1",
+  "site_id": "site-1",
+  "contract_version": 2,
+  "directory": "/var/lib/openparking/captures",
+  "interval_seconds": 60.0,
+  "retention_days": 30,
+  "max_bytes": null,
+  "max_snapshot_bytes": null,
+  "lane_declared": true,
+  "lane_url": "http://127.0.0.1:8090",
+  "cameras": [
+    {
+      "camera_id": "front",
+      "snapshot_url": "http://127.0.0.1:8080/axis-cgi/jpg/image.cgi",
+      "authenticated": true
+    }
+  ]
+}
+```
+
+**`interval_seconds` and `retention_days` in that example are the published
+defaults, and a test compares them by value against the constants they come
+from.** Every SIZE in every example on this page is `null`, and that is
+deliberate: **no disk figure, no bytes-per-image and no capacity appears anywhere
+in this document.** Nothing in this package has measured one — the figures are
+READS, on the health route, against one site's own disk. A number here would look
+measured, and a test refuses one.
+
+`directory` is on this route because where a site's personal data is kept is the
+first question anybody asks of this process, and the answer is a path on a box
+rather than a credential.
+
+`max_snapshot_bytes` is on it **beside `max_bytes`**, because the relationship
+between the two is the thing a site has to get right and startup refuses them the
+wrong way round.
+
+`snapshot_url` and `lane_url` are **rebuilt** from scheme, host, port and path,
+the way `GET /v1/monitor` rebuilds a target's. `authenticated` says a credential
+is configured. It is not the credential: **every credential in this package is
+read from a FILE**, is on no route, and is not in this process's argument vector.
+
+`lane_declared` is `false` at a standalone site, and `lane_url` is `null` with
+it. It decides whether any record here can ever carry a lane event reference.
+
+## `GET /v1/capture/health` — every code, and what is on the disk
+
+<!--payload:capture_health-->
+```json
+{
+  "contract_version": 2,
+  "codes": [
+    {
+      "code": "camera_feed_frozen",
+      "subject": "front",
+      "state": "ok",
+      "source": "measured",
+      "never_alarm": false,
+      "caveat": "IDENTICAL means identical: this compares the bytes of two consecutive snapshots and nothing else. A camera that burns a clock, a date or a frame counter into the image is therefore NEVER frozen by this measure, however dead its sensor -- the overlay changes the bytes. A camera with no overlay pointed at an empty lane at night can be byte-identical while working perfectly. This measure is a cheap true negative, not a test of whether a camera is seeing.",
+      "status": null,
+      "cause": null
+    }
+  ],
+  "lane_events_missed": null,
+  "store": {
+    "bytes_used": null,
+    "record_count": null,
+    "oldest_at": "2026-08-30T14:00:00+00:00",
+    "newest_at": "2026-08-30T14:03:11.482913+00:00",
+    "mean_bytes_per_record": null,
+    "records_last_24h": null,
+    "bytes_last_24h": null,
+    "projected_bytes_per_day": null,
+    "purged_by_age": null,
+    "purged_by_size": null,
+    "purged_by_crash": null
+  }
+}
+```
+
+### `codes`
+
+One entry per `(code, subject)`, and **every member of `capture_codes` ships on
+every response** — a payload missing one is refused when it is built, because a
+code that is absent reads to a consumer exactly like a code that is fine.
+
+**AND COMPLETE PER `(code, camera)`, which is the same rule one level down.**
+Every declared camera ships under **every camera code**, on every response,
+`unknown` until its first attempt — and a payload missing one of those pairs is
+refused when it is built, exactly as a missing code is. Without it, a camera that
+has never produced a state disappears from this payload the moment any OTHER
+camera reports: and the camera that has not answered since the process started is
+the one worth asking about. At a site with four cameras, the rule that a camera
+disconnected is a malfunction would fail for the camera that is worst broken.
+
+The lane's four codes ship under this process's own id at a **standalone** site:
+there is no lane to name, and *"no lane is declared"* is not the same fact as
+*"the lane is answering"*.
+
+The entry is the **lane contract's entry, field for field** — `state`, `source`,
+a boolean `never_alarm` on every entry, and a `caveat` — plus two fields that
+belong to a code rather than to the shape: a `status` on the codes that exist
+because something answered, and a `cause` on `camera_unreachable`. That the
+first four are the lane's is not a coincidence: it is what lets a monitor read
+this surface with the code that already reads a lane, and a monitor passing these
+entries on carries the four it knows.
+
+`lane_events_missed`, beside `codes`, is **how many lane events this process is
+known not to have followed since it started** — see `lane_backlog_lost` above.
+`0` at a standalone site: there is no lane to miss events from.
+
+**Everything here is `measured` and nothing here is `never_alarm`.** Every code
+is a physical thing that needs a person: a camera that has stopped answering, a
+disk that will not take a write, a store eating itself under a cap that is too
+small.
+
+`camera_feed_frozen` is the one that comes closest to a false alarm, and what it
+measures is published in its caveat rather than softened into silence: it
+compares the **bytes** of two consecutive snapshots and nothing else. **A camera
+that burns a clock, a date or a frame counter into the image is therefore never
+frozen by this measure, however dead its sensor** — the overlay changes the
+bytes. And a camera with no overlay pointed at an empty lane at night can be
+byte-identical while working perfectly. It is a cheap true negative, not a test
+of whether a camera is seeing. It is `unknown` until there have been two
+snapshots, and `unknown` again after any read that failed — comparing across an
+outage answers a different question.
+
+### `store` — the sizing, as READS
+
+Every field is measured from the directory when the route is asked. **This
+document states that they exist and what each is derived from. It states no
+value**, because nothing here has ever measured one.
+
+| | |
+|---|---|
+| `bytes_used`, `record_count` | Summed over the index, which is read off the disk. |
+| `oldest_at`, `newest_at` | The minimum and maximum `captured_at` held, **by value**. Not the ends of the index: a clock that steps back writes an earlier record after a later one, and read by position these two come out the wrong way round. |
+| `mean_bytes_per_record` | `bytes_used` over `record_count`. `null` at an empty store. |
+| `records_last_24h`, `bytes_last_24h` | Over records whose `captured_at` is within 24 hours of now. |
+| `projected_bytes_per_day` | `bytes_last_24h` scaled to a day over however much of that window this store has actually been recording for. **`null` under an hour of data** — multiplying four minutes by three hundred and sixty is a number that looks measured. |
+| `purged_by_age`, `purged_by_size` | How many records each half of the purge has removed since this process started. |
+| `purged_by_crash` | How many temporary files an index rebuild has removed since this process started. One of them is a write that died — nothing else can leave one — so this is how often a site is losing power mid-write. |
+
+## `GET /v1/capture/records?since=N` — the sidecars, never the bytes
+
+<!--payload:capture_records-->
+```json
+{
+  "contract_version": 2,
+  "cursor": 2,
+  "reset": false,
+  "dropped": null,
+  "records": [
+    {
+      "cursor": 2,
+      "id": "20260830T140311482Z_front_000002",
+      "captured_at": "2026-08-30T14:03:11.482913+00:00",
+      "camera_id": "front",
+      "reason": "lane_vend",
+      "lane_event_cursor": 7,
+      "lane_event_at": "2026-08-30T14:03:11.102913+00:00",
+      "lane_event_id": "9f2c1a7d-4e8b-40c2-a1f6-d3b8e5c07a91",
+      "capture_minus_lane_event_ms": 380,
+      "bytes": null,
+      "image_url": "/v1/capture/images/20260830T140311482Z_front_000002"
+    }
+  ]
+}
+```
+
+Deliberately the same shape and the same semantics as the lane contract's
+`GET /v1/lane/events` and the Vehicle ID service's `GET /v1/reads?since=N`, field
+for field, so **one consumer holds one cursor policy for every surface in this
+estate.**
+
+- The cursor is **monotonic within one run** and is **not durable across a
+  restart**. The store is durable; the cursor over it is not. On start the index
+  is rebuilt by reading the directory and numbered from one in capture order, so
+  a saved position no longer refers to the same record once anything has been
+  purged.
+- `since` ahead of this process's own cursor sets **`reset`**.
+- `since` behind the oldest record still held **also** sets `reset`. Here the
+  window is the STORE, and what evicts from it is the retention rule and the size
+  cap — so this flag is how a consumer learns that what it was going to fetch has
+  been **deleted**, rather than simply not served.
+- `dropped` is how many records the purge has removed since this process started.
+  A gap nobody knows about is worse than one that is counted.
+
+**The bytes are never inline.** A records page is a page a consumer polls, and a
+JPEG on it would make the cheapest read the most expensive one.
+
+### `capture_minus_lane_event_ms`, and the two clocks it spans
+
+Present on exactly the records a lane triggered, and `null` on an interval
+capture, which has no lane event to subtract. **It used to be called
+`trigger_to_capture_ms`** — a name that said "delay", which is a measurement, for
+a number that is a subtraction across two machines. It is named for what it is,
+and what it is says so here, in the one copy this document and the code share:
+
+> This is a SUBTRACTION ACROSS TWO CLOCKS: `captured_at` is read from this
+> process's clock and `lane_event_at` from the lane's. It is not a measured
+> delay. A NEGATIVE VALUE IS REACHABLE and is served -- it means the two
+> clocks disagree by at least that much, with the lane's ahead. Nothing here
+> measures the offset between them, so nothing here can separate the offset
+> from the time this process took to see the event, and correcting it would
+> mean a second measurement nobody has made. Where the two clocks are the
+> same box, or are disciplined to the same source, it is the cost of this
+> process being a CONSUMER of the lane's contract rather than something the
+> lane calls.
+
+This is the monitor half's "`lane_gone_quiet`, and the two clocks it spans"
+applied to this field, and for the same reason. The sentence lives in
+`contract.CAPTURE_MINUS_LANE_EVENT_NOTE`, is published here from that one copy,
+and a value test holds the two together: editing either goes red.
+
+## `GET /v1/capture/images/<id>` — one JPEG
+
+`Content-Type: image/jpeg`, the bytes exactly as the camera sent them. `404` for
+an id this store has no record of.
+
+**The id is looked up in the index. It is never joined onto the directory** — so
+`../` in one finds no record rather than finding a file, and the only paths this
+process opens are ones it wrote.
+
+## Running it
+
+```sh
+gate-agent capture --config capture.toml
+```
+
+Binds `127.0.0.1:8093`. **Local by design** — this is meant to run beside the
+lane it photographs.
+
+**Off loopback it refuses to start without a credential.** `--host` anything but
+loopback requires `--auth-token-file`, and with a token **every route requires
+`Authorization: Bearer <token>`, including the images.** That is stated because
+an image route left open "because it is just a JPEG" is the whole store readable
+by anyone who can enumerate a record id.
+
+The rule is `InsecureBind`, the same one the monitor, the lane service and the
+Vehicle ID service apply — imported here rather than restated, so three surfaces
+on one device cannot come to disagree about when a credential is required. The
+exposure it exists for is the sharpest of the three: the monitor publishes which
+of a site's lanes are broken; **this publishes pictures of cars and when they
+were taken.**
+
+## What is NOT here, stated rather than left to be discovered
+
+- **No act surface.** No capture on demand, no delete, no route that moves a
+  retention window. A record is deleted by the retention rule and by nothing
+  else — a delete route would be a way to remove the one image that mattered
+  from a store whose purpose is that the entries can be reconstructed
+  afterwards, and it would need an authorisation model this package does not
+  have.
+- **No plate reading from a stored capture.** This process records; it does not
+  identify. The capture rule's point is that the camera does not need to be
+  trustworthy enough to DECIDE in order to be useful enough to RECORD.
+- **No lane change of any kind.** The lane's own capture MODE — the accuracy bar
+  changing when the boom is broken — is the lane's decision path and a later
+  round. This round gives it somewhere to record.
+- **No RTSP**, and no camera that authenticates in a query string. See above.
+- **No second store.** Nothing is uploaded anywhere, and this process reports to
+  no platform. What leaves this box is what somebody fetches from these routes.
+- **No sizing.** How much disk a site needs is a read of that site's disk, on the
+  health route. Nothing in this package has measured a capture from any of the
+  cameras it is written for, and no figure appears in this document. The one
+  number that does — `max_snapshot_bytes_default` — is a ceiling on a read, is a
+  setting, and says so where it is published.
+- **No clock discipline, and no measurement of an offset.** This process reads
+  one clock. It does not correct one, it does not compare one against a lane's,
+  and it does not know how far out either is. What it does instead is say when
+  the two disagree in a way that changes what it keeps: `clock_stepped_back` on
+  its own, and `capture_minus_lane_event_ms` on every lane-triggered record.
+
+---
+
+Built by 72 Knots Method by 72Knots.ai
+
+---
+
+# The gate agent
+
+The third process in this package, under the same `contract_version` as the two
+above. It answers the intercom, works out which lane the call belongs to, reads
+that lane's last decision through the lane contract, says what happened in every
+language the site declared, and when the case needs a person it calls one, stays
+in both calls, and records the authorisation they key.
+
+## IT CAN NOW COMMAND A VEND, and here is exactly what that means
+
+**Until contract version 2 this agent opened nothing and could not.** That sentence is
+gone, and it is replaced rather than quietly dropped, because a reader who knew
+the old one needs to know precisely what took its place.
+
+**The LANE still decides. The agent asserts.** `POST /v1/lane/vend` applies the
+lane's own seven refusals — presence read off its arming loop AT THE MOMENT OF
+THE CALL, its own malfunction table, its own arming geometry, the age and the
+identity of its own last decision — and every one of them is derived from the
+code an ordinary arrival goes through. Nothing here checks any of them first: a
+second copy of those refusals is one that comes to disagree with the copy the
+barrier actually obeys.
+
+**One module can build a non-`GET` at a lane, and it is `act.py`.** It builds
+exactly one request, to exactly one path, held in a constant; it cannot be
+constructed without an ACT TOKEN, so a lane a site declared none for has no
+client at all rather than a client the lane would refuse; and it follows no
+redirect, because the request a `Location` would carry is the one holding the
+credential that opens a barrier. Every one of those is swept out of that
+module's source, because a route that exists and is never called is invisible to
+behaviour.
+
+**Two tokens, and the read one does not authorise an act.**
+`[lanes.<name>] token_file` reads where a vehicle was;
+`[lanes.<name>] act_token_file` opens a barrier. The lane makes the same split
+on its side: off loopback it refuses to serve the vend route without a second
+token.
+
+**`can_vend` is PER LANE and it is about this AGENT.** It is `true` where this
+agent holds an act token for that lane AND a key to sign a ticket with — a
+completion names an identity, and there has to be one to name. The LANE's own
+`can_vend` is on the lane's surface; republishing it here would be this agent
+making a claim about another machine out of a read it may not have made since
+that machine restarted.
+
+**The word is `commanded`, never `opened`.** `boom_did_not_rise` is `no_source`
+on the lane's own health surface: nothing in this estate has watched a barrier
+move. The event is `vend_commanded`, the driver hears *"the barrier has been
+asked to open"*, and the person hears the same.
+
+**A site can still run a call-only agent exactly.** No display, no act token: it
+answers, speaks the case, calls a person, and opens nothing. That is a supported
+configuration and not a degraded one, and it is what every intercom with no
+`display` and every lane with no `act_token_file` gets.
+
+## The ticket
+
+**A TICKET IS A CLAIM ON ONE ARRIVAL AND IT IS NOT AN IDENTITY.** Whoever
+photographed the code is holding it. That is exactly as strong as holding the
+paper ticket it replaces and no stronger — a ticket machine hands a strip of
+paper to whoever is standing there. Nothing here binds a PERSON to a ticket.
+
+**What binds it to an arrival is the PRESS**, not the signature: the ticket is
+offered on a lane's own decision, and it is vended only when somebody at that
+barrier presses the button inside the window.
+
+**What the signature is for** is the EXIT — a later round, in another process,
+possibly with no connectivity at all. It says this site issued this ticket. The
+key is per site, this agent alone holds it, and the lane never sees it: the lane
+checks a ticket's SHAPE and says so in its own contract.
+
+### The format, exactly, with a worked example
+
+The canonical form is UTF-8, five fields separated by `\n` (0x0a), in this order
+and no other:
+
+```
+OPT1
+<ticket_ref>
+<site>
+<lane>
+<issued_at>
+```
+
+**A field holds any UTF-8 except the separator, and that is the whole
+alphabet** — a `site_id` and a lane name are the site's own strings and this
+package does not narrow somebody's name for their own garage. A field containing
+a `\n` is refused rather than escaped: an escape is a second rule to get wrong.
+
+**AND THE REFUSAL IS AT STARTUP.** `[agent] site_id`, every `[lanes.<name>]` name
+and every `[intercoms.<uri>]` key are put through the same one function the mint
+uses, and a value that cannot be a ticket field is a **startup refusal naming the
+field** — the same shape as the font check, which refuses a language whose
+sentence the shipped font cannot draw. Checking only at the mint meant a site
+named with a newline started, published a healthy surface, and refused its FIRST
+TICKET at three in the morning: a traceback per arrival, no ticket ever issued,
+the poll's `_advance()` skipped, and nothing on the health surface saying why.
+
+The signature is `HMAC-SHA256(key, canonical)` — 32 bytes — appended to the
+canonical bytes. **The QR payload is `base32(canonical || signature)`,
+RFC 4648, unpadded, uppercase**, and `verify` refuses a payload that is not the
+canonical encoding of the ticket it holds: base32 pads its last group with bits
+that carry nothing, so without that check one ticket has several spellings and
+an exit keying on the string it decoded could file one stay twice.
+
+**It is compared EXACTLY as minted.** The comparison used to happen after
+`strip().upper()`, so precisely the spellings that survived the normalisation
+survived the check: lower case, mixed case and surrounding whitespace all
+verified, and one ticket had four spellings instead of one. There is no
+normalisation before the check now — a padded payload, a lower-case payload and
+a payload with a space round it are each refused.
+
+**Why base32 rather than the fields themselves.** QR's ALPHANUMERIC mode holds
+45 characters — `0-9 A-Z $ % * + - . / :` and space — and is about half the size
+of byte mode. A site's `site_id` and its lane names are the site's own strings,
+and `site-1` is already outside that set because of its lowercase letters. The
+alternative was refusing a site its own naming to suit an encoder.
+
+<!--payload:ticket-vector-->
+```
+key        an-example-signing-key-for-the-docs-0000
+ticket_ref K7M2QRTX
+site       site-1
+lane       entry
+issued_at  2026-08-31T14:03:11+00:00
+
+canonical  4f5054310a4b374d32515254580a736974652d310a656e7472790a
+           323032362d30382d33315431343a30333a31312b30303a3030
+payload    J5IFIMIKJM3U2MSRKJKFQCTTNF2GKLJRBJSW45DSPEFDEMBSGYWTAOBNGMYVIMJUHIYDGORRGEVT
+           AMB2GAYEGEYDVKSK52N4U6PL2WPOA7DRCKV6ZYSC3EUFLF5HHT36ZFVKYUA
+```
+
+That vector is produced by the shipped code and pinned in `tests/test_tickets.py`;
+this block is compared against it. **A format nobody can reproduce from this
+document is a format the exit will guess at.**
+
+### What is in a ticket and what is not
+
+| | |
+|---|---|
+| `ticket_ref` | 8 characters from a **confusable-free** alphabet — `A–Z` without `I` and `O`, and `2–9` — from `secrets`. It is what a person reads aloud over an intercom, and it is inside the shape the lane publishes for one (`6–64` of `A-Z0-9-`). **It is on no event, no read route and no log line**: it identifies one stay, it is personal data while that stay exists, and the ticket RECORD is the one place on this box it is written down. |
+| `ticket_id` | The agent's own opaque handle, 16 random bytes as uppercase hex. It IS the vend's `Idempotency-Key`, so it satisfies the lane's shape for one. It is on every ticket and vend event. **It is not in the QR**: putting it on a screen would publish the value that makes a vend happen once. |
+| `site`, `lane` | Where it was issued. For a STANDALONE intercom `lane` is that intercom's URI, because there is no lane and a ticket has to say where it came from. |
+| `issued_at` | ISO 8601 with an explicit UTC offset. A naive moment is a guess about which machine it came from. |
+| a plate | **There is none.** This package never reads one. |
+
+### Retention
+
+`[tickets] retention_days`, **published default 30** — the platform's own
+default for the stay this ticket identifies, so a site that has both does not
+hold one for a month here and a week there. **The purge DELETES**, like the
+capture store's: there is no foreign key here and no money record hanging off a
+ticket, so a retention that nulled fields and kept the row would not be one.
+
+The age measured is the record's `issued_at`, because that is when the personal
+data was created — a ticket voided a month later is not a fresh one. **A record
+whose age this build cannot read is LEFT**, not swept: a purge acting on an age
+it never measured is not a retention rule.
+
+**The record is what a standalone site has instead of a platform.** It holds the
+whole life of one ticket: issued, confirmed, vended or voided, with the moment
+of each and the lane's own answer.
+
+## The display
+
+`[displays.<name>] framebuffer` is a device — `/dev/fb0` on most boards — and
+**the geometry is READ, never configured**: `virtual_size` and `bits_per_pixel`
+come from `/sys/class/graphics/<fb>/`, at startup. A site that typed its own
+resolution is a site whose display is silently wrong the day somebody changes a
+cable, and a frame written at the wrong stride is not a smaller picture but
+diagonal noise. An unreadable geometry is a **startup refusal** naming the file,
+and so is a depth that is not 16, 24 or 32.
+
+**Monochrome, which is what makes the pixel format not matter.** White is every
+bit set and black every bit clear at all three depths, so a frame is written
+without knowing whether the driver wants BGRA, RGBA or RGB565. The moment
+anything here draws a colour that stops being true.
+
+`[intercoms.<uri>] display` is **declared**, with no default: a guessed display
+is a code shown at a barrier somebody is not standing at. **An intercom with
+none offers no ticket** and its cases go to a person exactly as at a
+call-only agent.
+
+**ONE DISPLAY PER LANE, refused at startup naming both URIs.** A pending ticket
+is one per lane and every screen at that lane was shown it, so two intercoms
+with displays on one lane put one code on two door stations and a press at
+either confirmed it. A second intercom at that lane with NO display is the
+ordinary two-door lane and is accepted: the ticket is bound to the one screen
+that shows it, and a press at the other door is call-only.
+
+**THE GEOMETRY IS RE-READ AND THE FRAME RE-WRITTEN ON EVERY LANE POLL WHILE A
+TICKET IS UP.** Reading it once at startup is the same defect the document
+argues against, one step later: from the moment somebody changes a cable, the
+frame goes on being written at the old stride, which is diagonal noise on the
+panel while the agent believes a code is up. A screen that cannot be asked, or
+that refuses the write, voids the ticket `display_unavailable`, raises that code
+and sends the next press to a person; a screen that has CHANGED is re-rendered
+at the new geometry and records `display_geometry_changed`.
+
+**The frame**: the QR filling the short side less a margin, the `ticket_ref`
+printed under it, and one instruction line per declared driver language. **Upper
+case only** — a decision, because this repository has to be able to CHECK every
+glyph it ships, and half a font is half the drawing and half the review. **A
+character the shipped font cannot draw is a STARTUP REFUSAL naming the line and
+the language.** Never a blank, which is a driver told nothing, and never a
+substitution, which is a driver told something else.
+
+**Idle is a BLACK frame, and so is exit.** Not a logo and not a clock: a screen
+showing anything invites a driver to read it, and there is nothing to say
+between arrivals. **The exit half is built rather than described**: the agent
+process blanks every declared screen in one `finally`, and `SIGTERM` — which is
+how a service manager stops this — raises into it, as `SIGINT` and a
+`KeyboardInterrupt` already did. It used to be published here and implemented
+nowhere, so an ordinary `systemctl restart gate-agent` during a package upgrade
+left the last ticket on the screen.
+
+**A KILLED PROCESS LEAVES THE LAST FRAME UP.** A framebuffer holds what was
+written to it and nothing repaints it, so a process that dies without unwinding
+leaves a ticket on the screen. **That ticket can never be vended**: no pending
+ticket survives a restart, the record is settled `restarted` at the next start,
+and the press that would have confirmed it goes to a person.
+
+**So after a crash a driver may be holding a photograph of a `restarted`
+ticket.** It is not an exit token and it never was one: its record says
+`voided/restarted`, the exit will read that, and **the exit for that stay is a
+human's**. If the person then keys `OPEN_NOW`, a NEW ticket is minted for the
+completion — the lane's completion names an identity and there has to be one to
+name — so that stay has two records, one voided and one vended, and the vended
+one is the stay. The driver holds the other. That is stated here rather than
+left for an exit round to discover.
+
+### A closed lane, and the board
+
+The lane publishes two more things on `GET /v1/lane/state`, both added within
+its version 2: `lane` — open, or **closed by its owner** with a reason and the
+owner's message — and `board`, the items its screen shows while nothing else
+wants it: the owner's messages in force now (which lanes and which times is the
+LANE's decision, offline too) and, where the owner switched it on, the price the
+lane worked out with the same engine and tax it charges with. A lane that
+publishes neither is open with an empty board.
+
+**Which frame wins is one line**, `display.frame_wanted`:
+
+    ticket, then fee, then the CLOSED message, then the BOARD, then black.
+
+- **A closed lane's message is shown ALONE**: upper case, whole, wrapped between
+  words — a word is carried across lines only when it is wider than the screen,
+  and then every character of it is still on the screen. It is drawn at the
+  largest scale it fits, and **never below two pixels a module**
+  (`board.MESSAGE_SCALE_MIN`): legible means that, here. The platform bounds a
+  message at 160 characters, and `tests/test_board.py` measures 160 characters
+  of the widest-wrapping words fitting at that size on 320x240 and 800x480. A
+  message that cannot be drawn whole and legible on a screen — a character the
+  font lacks, or a screen too small — is never drawn with a letter missing: the
+  frame says `THIS LANE IS CLOSED` in every declared driver language instead.
+- **A ticket or a fee wins over it and gives the screen BACK to it** when it
+  ends — never to black on the way. Reopening the lane gives black (or the
+  board).
+- **The board shows one item at a time for `board.BOARD_ITEM_SECONDS` (8 s)**,
+  in the lane's order, round and round, **on its own clock**
+  (`board.Rotation`, turned on every pass of the agent's loop) — not on the
+  state poll. Each item holds the screen for its whole turn at any
+  `poll_seconds` a site sets; the poll only changes WHAT is on the board (an
+  item the lane still publishes keeps the rest of its turn; one it stopped
+  publishing comes down at once). A ticket, a fee or a closed lane's message
+  still takes the screen at once, and the board comes back to a whole turn of
+  the item it was on. A loop too slow to keep the turns is refused at start
+  by name (`board.check_pass`). A price line is written exactly as the
+  fee frame writes a figure, with the digits the lane published; a line that
+  cannot be written is left out, and an item left with no line is not shown.
+- **A closed lane offers no ticket**, and a call there hears `lane_closed`
+  (below): the lane refuses a display code at a closed lane, whichever reason
+  closed it, and only a person's word opens it.
+- **What the person is NOT told is the owner's message.** Every sentence this
+  agent plays is a file built from `lines.TEXT` — nothing is composed at
+  runtime — so the person hears that the lane is closed by its owner, and the
+  message itself is on the screen at the lane, not in the call.
+
+### The QR encoder is ours, and something else proves it
+
+No runtime dependency: `dependencies = []` is a property of this package, and
+this runs on a box in a gate housing. **Versions 1 to 22, level M**,
+alphanumeric or byte mode. An encoder nobody can read back is a picture of a QR
+code, so every symbol it builds is read by **OpenCV's `QRCodeDetector`**, a
+test-only dependency, across every version at the longest payload each one
+holds — and a frame that cannot be decoded is a red test.
+
+**Level M is a choice and is stated as one.** The surface is a screen behind
+glass in weather, photographed at an angle by a phone in one hand. L would be
+smaller and Q bigger, and **which of them a real lane wants is NOT MEASURED**.
+
+**Twenty-two and not forty**, because the block table for versions 23, 24, 25
+and 27 through 40 could not be supported: a check that derives the number of
+data modules from the matrix found them inconsistent with the symbol they
+describe, and the rows were deleted rather than repaired from memory. Version 22
+holds 1,782 alphanumeric characters; a ticket payload is 135. A payload past it
+is **refused, never truncated** — a truncated ticket is one the exit reads as a
+forgery.
+
+## When a ticket is offered, and when it goes away
+
+The agent follows each declared lane's `GET /v1/lane/events` by cursor —
+`[lanes.<name>] poll_seconds`, **published default 2.0**, and an ASSUMPTION:
+nothing has measured how long a driver will look at a blank display before
+deciding nothing is coming. Only lanes where a ticket could be offered or a vend
+commanded are followed; a first read adopts the lane's cursor and acts on
+nothing already in the window, because those cars have gone.
+
+**A ticket is offered when all of this is true**, and each clause is
+load-bearing:
+
+| | |
+|---|---|
+| a NEW decision | not a decision already in the window when this process started |
+| **the DECISION's** case is one of four | `identification_unavailable`, `plate_not_read`, `plate_unclear`, `vehicle_not_recognised` — the cases where the lane made a decision and could not say who this vehicle is |
+| the decision is not stale | past `[cases] decision_max_age_seconds` it was made for somebody else, and a ticket against it is a code on a screen for a car that has gone |
+| `decision.presence` is **`true`** | **`null` is not `true`.** An unmeasured presence is every lane by default, and one putting a code on a screen is this project's own fraud arriving through a display instead of a loop |
+| the intercom at that lane declares a display | a ticket nobody can see is a stay nobody can prove |
+| `[tickets]` is declared | there is a key to sign one with |
+
+**THE HEALTH IS NOT ON THAT LIST, and that is a correction.** Whether
+a ticket is OFFERED and what a driver HEARS are two questions
+(`cases.offers_ticket` and `cases.derive`), and they used to be one. `derive()`
+answers `malfunction_active` for any active non-`never_alarm` code before it
+looks at the decision — which is right for the sentence a driver hears, and was
+wrong for the offer: **a lane whose identification engine is down answers
+`engine_unreachable` AND carries `identity_service_down` active in the same
+breath.** That is the ordinary state, not an exotic one; it is the case the lane
+was changed for; and it offered no ticket at all. Fifteen of the sixteen
+codes the lane vends on suppressed one, including `disk_nearly_full` and
+`outbox_depth_growing`, which are a disk and a queue.
+
+**Why the other cases are not on it**, one by one: `entry_refused` — the lane
+knows who this is and said no, and only a human overturns a rule.
+`vehicle_not_detected` — the lane believes the lane is empty, and the vend
+route's first refusal is that same loop read. `entry_not_confirmed` — a vend
+already happened. `lane_unavailable`, `stale_decision`, `unrecognised_reason` —
+the lane cannot be believed about this vehicle. `standalone` — no lane, no loop,
+no presence source at all. `nothing_to_do` — the driver already got in.
+`malfunction_active` is on that list **for the spoken case only**: the offer is
+decided by the decision.
+
+**`vend_blocking` is NOT copied.** The lane publishes that subset in its
+document's closed-sets block; `GET /v1/lane` does not serve it, and this build
+does not hold a second copy of it. **So a blocking malfunction is the LANE'S
+refusal to give, and it gives it at the vend**: the ticket is offered, the press
+reaches `POST /v1/lane/vend`, the lane answers `409 malfunction_active` naming
+the code, and the person hears that a ticket was refused and why. That is the
+ordinary path for those five and not a caveat about a rare one.
+
+**A ticket is VOIDED**, with the reason on the record and on
+`ticket_voided`, when:
+
+| reason | |
+|---|---|
+| `window_elapsed` | `[tickets] confirm_window_s`, **published default 90.0** — an ASSUMPTION: nothing has measured how long a driver takes to photograph a code and press a button |
+| `presence_lost` | the lane says the car has gone, with no new decision behind it |
+| `lane_decided_again` | a new decision, or a reset cursor. **That and nothing else.** The ticket named the previous decision's moment and the lane refuses a completion naming anything else |
+| `restarted` | **no pending ticket survives a restart, by design** — and the record is now settled to say so at the next start, which is where this reason is written |
+| `display_unavailable` | the screen refused the frame or its geometry could not be read — at the mint of a ticket OFFERED to the driver, or on any later poll while the code was up. **Not a ticket minted for a person's `OPEN_NOW` / `OPEN_AND_FLAG`**: see below |
+| `lane_refused` | the lane considered the completion and said no. Its own code is in `lane_answer`, verbatim |
+| `lane_unreachable` | the lane did not answer the vend, or answered a 5xx. There is no `lane_answer`, because there was no answer |
+| `act_refused` | a 401, a 403 or a 404 on the vend route: the lane would not consider it at all |
+| `relay_failed` | STANDALONE — the intercom's own relay did not pulse. `relay_pulse_failed` carries the cause |
+| `outcome_unknown` | a `confirmed` record found at startup whose vend could not be settled. **Not "it did not open"** — "this build cannot say either way", and `lane_answer` carries whatever the lane did say |
+| `no_act_route` | a press confirmed it at a lane this agent holds **no act token** for, so no vend was sent and none ever will be — the lane never learns of this ticket. Written at the press. It used to be left `confirmed`, and the next start wrote `outcome_unknown` over an outcome that was known |
+| `do_not_open` | the person on the call keyed `do_not_open`. A ticket left pending at that lane was one the driver's next press would have vended against what the person decided |
+
+**Six of these came with the vend route, and five of them replace one wrong answer.**
+`lane_decided_again` used to be written for every outcome that was not a vend —
+a lane that refused with its own code, a lane that could not be reached, an act
+token the lane would not accept — so the record asserted a cause that had not
+happened in six of the seven ways a press can end, confidently, in the one place
+a standalone site keeps. `lane_answer` carried the truth beside it in four of
+them and `null` in two.
+
+**`lane_answer`** is what the lane said, verbatim and never translated: its
+refusal `code` on a 409, or its `event_cursor` on a 202. A lane that is not ours
+has its own vocabulary and this is where it survives.
+
+## The press, and the help that follows it
+
+**An inbound call at the intercom whose screen holds a PENDING ticket the driver
+HAS BEEN TOLD ABOUT is the driver's confirmation.** The agent answers, records
+`ticket_confirmed`, says `ticket.confirmed`, and commands the vend with
+`authorised_by = display_code_confirmed`, `identity = {kind: "ticket",
+ticket_ref}`, `decision_at` **echoed** from the decision the ticket was minted
+against, and `Idempotency-Key = ticket_id`.
+
+**Every clause of that sentence is a refusal of something that used to happen.**
+
+**"the intercom whose screen holds it"** — a pending ticket is one per LANE, and
+every screen at that lane was shown it. Two intercoms with displays on one lane
+is now a STARTUP REFUSAL naming both, because a press at either confirmed the
+one code and whoever photographed the second screen was holding the first
+driver's ticket. A second door at that lane with no display is fine and is
+ordinary: its press is call-only.
+
+**"HAS BEEN TOLD ABOUT"** — the ticket path runs on `[lanes.*] poll_seconds`, so
+a driver can press in the gap between the lane deciding and the poll that mints.
+What used to happen there was: a person was dialled while a valid, unexpired
+ticket was on the screen a metre from the driver, minted in the same poll, with
+neither of them told it was there — and the driver's NEXT press then vended a
+code they had never seen and never photographed. They drove in with a stay whose
+only identity was a reference nobody held.
+
+So **the press mints when the poll has not**: if a ticket is offered at that lane
+and none is pending, the agent mints one ON THE PRESS, shows it, says
+`ticket.on_screen` — *there is a code on the screen; photograph it and press
+again* — and **rings nobody**. A ticket the poll mints WHILE a call is up at that
+lane's intercom is spoken in that call the same way instead of dialling. Every
+ticket record carries **`told_at`**: set at the issue where nobody is on the
+phone, because the screen is where a driver looks, and set when
+`ticket.on_screen` has FINISHED where somebody is. **A press confirms only a
+ticket with `told_at` set** — otherwise it is that sentence again, and the next
+press confirms.
+
+**Somebody is on the phone for as long as a call at that door is still in its
+case**, not only before a person is rung. A ticket minted while a person is
+ringing, briefing, waiting for a digit, holding or collecting a number is said to
+nobody — the person is in the case — and it is minted with `told_at` unset, so
+the driver's next press is told about it before it can confirm it. It used to be
+minted told, and that next press vended it. **A call that is closing does not
+count**: its case is decided and only its closing sentences are left
+(`ticket.confirmed`, `ticket.vend_commanded`, `ticket.on_screen`, an
+authorisation's sentence). A ticket minted then — usually the next car's — has
+`told_at` set at the issue, as before, and that driver's one press vends it.
+
+**What a press proves, exactly: that somebody at that barrier pressed.** Not
+that a CAR is there — that is the lane's question, read off its loop at vend
+time, and never this agent's. And not WHO: whoever photographed the code holds
+the ticket.
+
+**A `202`** is `vend_commanded`, and the driver hears that the barrier has been
+**asked** to open. The lane's answer carries `event_cursor` and `transit` —
+**not a `completion_id`**: the completion's own identifier is minted by the lane
+onto its `assisted_identity` event, which is on `GET /v1/lane/events` and is not
+served to the caller. The cursor is the join to that record and is what this
+agent keeps.
+
+**A `409`** is `vend_refused` with the LANE'S OWN code on the record, never
+translated, and the case goes to a person who is **always told two things**:
+`operator.ticket_refused` — *this driver's ticket was refused by the entrance* —
+and then the sentence for that code, or `operator.vend_refused.unknown` — *the
+entrance gave a reason I have no words for* — where this build has none.
+
+**The DRIVER hears one sentence, and which one depends on the code.** For
+`vehicle_too_close` it is `ticket.vend_refused.vehicle_too_close` — *the vehicle
+behind you is too close for the barrier to open; please ask them to back up a
+little, then it will open* — the one refusal a driver is told by name, because
+it is the one they can do something about. For every other code, ours or a
+foreign lane's own, it is the generic `ticket.vend_refused` — *the entrance did
+not accept that, I am connecting you to a person*. The driver's per-code lines
+are LISTED in `lines.DRIVER_LINES`, not derived from the refusal set the way the
+operator's are: a derived set would demand a driver sentence for every code,
+and nobody has written or approved those. A second code-specific line is a
+second listed key. **Either way the call then goes to a person** — a driver
+told the car behind is too close, whose car behind does not move, has a
+sentence and no way out otherwise.
+
+**The second half of that is the third-party seat, and it was missing.** The
+sentence table is set-equal to OUR lane's `VendRefusal`, which is the right check
+for our lane and no check at all for a lane that is not ours. A
+foreign lane refusing with its own word reached a person who was briefed as an
+ordinary case: not told a ticket had been confirmed, not told it had been
+refused, and then offered `OPEN_NOW`. **The menu still offers `OPEN_NOW`**, and
+it will meet the same refusal unless the cause has changed — the lane applies its
+refusals to a human's completion exactly as it does to a driver's, which is the
+whole design and not an oversight.
+
+**A `401`, `403` or `404`** is `lane_act_refused`, which is a different fact and
+a different machine: the lane would not consider the request at all, because the
+act token is wrong or that lane is an older build with no such route.
+
+### Help is the next press
+
+**A call at the same intercom within `[tickets] help_window_s` of a
+confirmation — published default 60.0, an ASSUMPTION — is HELP, and the window
+belongs to THAT TICKET.** It is the ordinary case path, with the person told that
+a ticket was just confirmed and what the vend answered, before the menu. **It is
+never a second vend**: the lane's `already_completed` is the backstop, not the
+design.
+
+**A NEW DECISION AT THAT LANE, OR A NEW TICKET, ENDS IT.** The window used to be
+a moment and a pair of sentences keyed on the DOOR, with nothing tying either to
+a ticket, an arrival or a driver — so thirty seconds after one driver vended, the
+NEXT car's driver, with a ticket of their own on the screen, was briefed to the
+operator with *"this driver was given a ticket a moment ago"* and *"the barrier
+has been asked to open"*. Both were false about the person on the line, their own
+ticket was never confirmed, and it expired unvended while they were on the phone.
+The operator decides whether to open a barrier on that briefing.
+
+**The window rests on CALL COUNT**, which is nothing this agent reads from the
+button itself. **Whether a given door station places a second call while the
+first is still up is NOT MEASURED** and is in the January list. The agent hangs
+up promptly after the `ticket.*` lines, so the common case is two separate
+calls.
+
+A press at an intercom with no pending ticket is call-only.
+
+## The human's `OPEN_NOW` and `OPEN_AND_FLAG`
+
+They go through the **same route** with a different authority — one vend path,
+not two — so "a human opened it" and "a driver confirmed a ticket" are the same
+record with a different name on it.
+
+If a ticket is pending it is used; otherwise one is minted, against the lane's
+decision read at that moment. Where a display is declared the driver sees it;
+**where none is, the driver leaves with a stay and no exit token, and the exit
+is then the human's.**
+
+`human_open_now` on a lane whose last decision is `deny` VENDS — it is the only
+authority the lane accepts on one, and the lane records it as an override by
+name on the event it writes before the barrier moves. `human_open_and_flag` does
+not override a rule: a completion somebody is unsure about and a person
+overturning a refusal are different acts, and one of them is not made safer by
+being uncertain.
+
+**`operator.cannot_open` is spoken only where nothing can act** — no act token
+for that lane, or a standalone intercom with no relay — and it is not optional
+where it is true.
+
+**The person hears the lane's answer ON THEIR OWN CALL, and nobody is rung
+again.** `202`: `operator.vend_commanded`, and the case ends when that sentence
+has finished. `409`: `operator.ticket_refused` and the code's own sentence (or
+`operator.vend_refused.unknown`), as at a press. A `401`/`403`/`404` on the vend
+route: the same two, with the unknown sentence. A lane that did not answer:
+`operator_case.lane_unavailable`. After any of those the menu is read again on
+the same call and a digit is awaited — it still offers `OPEN_NOW`, which meets
+the same refusal unless the cause has changed. This used to go through the
+press's path to a person, which DIALLED the person again while their first call
+was still up: the answer was queued for a briefing they never heard, the first
+call was no longer the case's and was left live when the case ended, and this
+user agent's bridge is site-wide.
+
+**A screen that refuses the frame does not stop a person's open.** The record is
+written and the vend commanded as if the screen had shown it, and
+`display_unavailable` goes active. Only a ticket OFFERED to a driver is voided on
+a screen failure, because that one is a stay nobody can prove; a person has
+authorised this one, and the screen is only the driver's photograph. It used to
+void, and the person heard *"this entrance is not set up for this system to open
+it"* at a lane that could act.
+
+**The code comes off the screen.** A ticket used for a person's open is not
+pending, so nothing that clears pending tickets ever saw it: an idle lane showed
+it to the next car. It now stays up while the driver is told the outcome and
+comes down when the case ends; a ticket the lane refused comes down at once.
+
+**`do_not_open` voids any ticket pending at that lane**, reason `do_not_open`, so
+the driver's next press cannot vend it against what the person said.
+
+## Standalone: the intercom's own relay
+
+Only where `lane = "none"`. **Where there is a lane the LANE moves its own
+barrier**, and the configuration refuses a relay beside one: two things opening
+one gate is a barrier that opens with no record on the machine that keeps the
+records.
+
+**THE ORDER IS THE INVARIANT.** There is no lane, so this agent's own record is
+written and FLUSHED before the relay pulses — and if it cannot be written,
+nothing moves. **AND NOTHING MEASURES PRESENCE.** There is no loop, no camera
+and no gate. **The human, who can hear the driver, is the presence check**, and
+that is the whole of it. There is no self-service ticket here: a button that
+issues one with no car behind it is the market failure this project exists
+around.
+
+`[intercoms.<uri>.relay]`: `kind = "axis_vapix"` — **the only kind this version
+drives**; 2N and Akuvox have their own APIs and their own authentication, and a
+kind written without a device to try it against would be an untested path
+wearing the same name as a tested one — plus `url`, `port` (1 or 2),
+`credentials_file`, and `pulse_ms`, which is **declared with no default**: how
+long a contact must close for a barrier to accept it is that BARRIER's
+specification.
+
+**`pulse_ms` is BOUNDED: 1 to 10000, refused at startup outside it.** It was the
+one per-site number in this round that was neither a published default nor a
+declared value inside anything, and the request that pulses the relay is held
+open for the whole of it.
+
+**THE HTTP TIMEOUT IS DERIVED**: `pulse_ms / 1000 + [intercoms.<uri>.relay]
+answer_margin_s`, **published default 5.0 and an ASSUMPTION** — nothing here has
+driven a real unit, so nothing has measured whether one answers immediately or
+holds the connection for the contact. It used to be a hard-coded 5.0 s no site
+could change, so a legal six-second barrier was reported as a relay that could
+not be REACHED — while the unit was mid-pulse and the barrier very probably
+opening, with `relay_pulsed` already on the event stream. Three surfaces, three
+answers, and the gate open. **Whether a unit does hold the connection is on the
+January list.**
+
+**THE PULSE RUNS ON ITS OWN THREAD.** `poll()` used to make the request itself,
+so for its whole length the agent played nothing, answered nothing and followed
+no lane — on the one path in this repository that moves a barrier. The outcome is
+collected on a later poll and the operator is told then;
+`[escalation] nothing_usable_seconds` bounds how long they wait, and past it they
+are told this agent cannot say the barrier opened, which is what it can support.
+
+**`relay_pulsed` IS WRITTEN ONLY AFTER THE UNIT ANSWERED AS THE DOCUMENT SAYS**,
+and a pulse that did not happen writes **`relay_pulse_failed`** with the cause
+and the port, and takes the ticket record to `relay_failed`. It used to be
+recorded BEFORE the request and stood whether the unit refused, answered
+something else or was not there at all — and at a standalone site
+`/v1/agent/events` is the only machine-readable account of a barrier there is.
+A pulse the unit accepted takes the record to `vended`, with no `lane_answer`,
+because there is no lane here and nothing answered but the relay.
+
+**The operator ALWAYS hears one of two sentences** — `operator.vend_commanded`
+or `operator.cannot_open` — and every exception the relay can raise is mapped to
+one of them. **The calls end only when that sentence has finished on the
+person's leg.** They used to end when the DRIVER's leg went quiet, and here the
+driver's sentence is over before the relay answers, so the person's was started
+and cut off in the same poll. `urllib`'s own auth machinery raises for a challenge it cannot
+parse, and a `Digest` challenge with no `realm` used to raise straight out of
+`poll()`: the barrier did not move, the person who had just authorised it was
+told nothing, the call was torn down in silence, neither relay code fired, and
+`relay_pulsed` stood. Four surfaces and the only correct one was the log.
+
+**Digest only.** A unit challenging `Basic` is `relay_refused_us` naming the
+scheme: a credential that opens a barrier is not sent under one that carries it
+in the clear. `qop="auth-int"`, a challenge with no `realm` or no `nonce`, a
+`401` that survives the credential, and a `200` with a body are all
+`relay_refused_us` naming the reason — **the unit ANSWERED**, which is a
+different repair from silence, and the two are told apart by whether a response
+was seen rather than by which exception class arrived.
+
+**What Axis documents**, quoted from *"Input and outputs | Axis developer
+documentation"* (`https://developer.axis.com/vapix/network-video/input-and-outputs/`,
+read 2026-08-31):
+
+- the request is a **`GET`**:
+  `GET /axis-cgi/io/port.cgi?<argument>=<value>[&=<value>...]`
+- the output argument is `action=<string>`, whose format is
+  `[<Port ID>]:<a>[<wait><a>...]`, where `<a>` is `/` for active or `\` for
+  inactive and `<wait>` is a delay in milliseconds;
+- *"The `:`, `/` and `\` characters must be percent-encoded in the URI."* Its
+  own example: to *"Set output 1 to active, use `1:/`. In the URI, the action
+  argument becomes `action=1%3A%2F`"*; a two-pulse example is
+  `action=2%3A%2F300%5C500%2F300%5C`;
+- port numbering *"starts from one (where one corresponds to the physical port
+  labeled '1')"*;
+- the documented success is **`200 OK`**, `Content-Type: text/plain`, with an
+  **empty body for action arguments**;
+- the stated access level is **Viewer**.
+
+So one pulse of `N` milliseconds on port `P` is `action=P:/N\`, which on the
+wire is `action=<P>%3A%2F<N>%5C`. A body where the document says empty is
+`relay_refused_us`: a login page answering `200` read as a success is a barrier
+reported open on somebody else's web server.
+
+**THE WHOLE RELAY PATH IS NOT MEASURED AGAINST A DEVICE.** What is tested is a
+fake that answers as the document says and **verifies the digest** — realm,
+nonce, qop and the computed response — across the seven challenges above.
+Nobody has driven a real unit, seen a real barrier, or found out what one does
+with a `pulse_ms` its own barrier disagrees with.
+
+**AND AT A STANDALONE SITE, THE FOUR CODES THIS ROUND ADDS REACH NOBODY UNLESS
+A `gate-agent monitor` PROCESS IS RUNNING.** `display_unavailable`,
+`lane_act_refused`, `relay_unreachable` and `relay_refused_us` are on
+`GET /v1/agent/health`, which is local-only by design; the thing that reads a
+health surface and tells a human is the monitor, and it is a separate process
+with its own configuration and its own sinks. Standalone is the mode with no
+platform and often no second process. Nothing in this round requires a monitor at
+a standalone site — it is said here so that a site running the agent alone knows
+that its relay failing is a code nobody is watching.
+
+## The four modes
+
+| | what runs | what opens the barrier |
+|---|---|---|
+| **an intercom alone** | nothing of ours | whatever that site already does |
+| **agent + intercom** (standalone) | the agent, and a relay if one is declared | a HUMAN's word, through that intercom's own relay. No lane, no loop, no presence measurement at all |
+| **agent + lane** | the agent and the lane | the LANE, on `POST /v1/lane/vend`, applying its own refusals. The lane's outbox owns the platform record |
+| **full system** | all of it | as above, with the platform holding the durable record of the stay |
+
+## What has been measured, and what has not
+
+**The SIP path has been exercised against baresip 4.11.0, in CI, on a real
+socket:** a registrar built in the test suite, a second baresip instance placing
+a call as the intercom, a third answering as the person, real RTP between them,
+real RFC 4733 DTMF, and the audio each side received written to a file and
+measured. That test is what establishes that a call is answered, that the two
+legs are private until the agent bridges them, and that a digit arrives tagged
+with the leg it came in on.
+
+**It has never been run against an Axis, a 2N, or any other real intercom, and
+it cannot be here.** Call setup time, audio quality, echo, and DTMF detection
+through a door station's microphone and a real garage's network are **NOT
+MEASURED** — and neither is **whether a door station's call list advances on the
+`486 Busy Here` this agent sends when it is already on a case, or only on a
+no-answer timeout.** Nobody should read the CI result as a statement about any of
+them.
+
+### The January list: what is NOT MEASURED, in full
+
+Nothing below has been observed. Every one of them needs a real site, and each
+is stated here rather than left to be discovered by whoever installs the first
+one.
+
+| | |
+|---|---|
+| **a real display** | No frame has been put on a real screen. Geometry, stride and depth are handled from what a driver publishes and tested against a stand-in; refresh, backlight, glare and viewing angle are unmeasured |
+| **a phone camera at lane distance** | Nobody has photographed a code off a screen from a driver's seat. The module size, the scale, the quiet zone and **level M** are all choices, and whether they read through a windscreen at night in rain is the measurement that decides them |
+| **a real intercom's second press** | The help window rests on the door station placing a SECOND CALL. Whether a given unit will while the first is still up is a property of that unit |
+| **whether a door station's call list advances** | On the `486 Busy Here` this agent sends when it is already on a case, or only on a no-answer timeout |
+| **the relay, at all** | No Axis unit has been driven by this code. What a real one does with a `pulse_ms` its own barrier disagrees with, and whether that barrier accepts the pulse, are both unknown |
+| **whether the unit holds the HTTP connection for the pulse** | The timeout is DERIVED as `pulse_ms / 1000 + answer_margin_s` precisely because nobody knows. If a unit answers immediately the margin is the whole of it; if it holds the connection for the contact, the derivation is what stops a six-second barrier being reported as a relay that could not be reached |
+| **the barrier** | `boom_did_not_rise` is `no_source` on the lane's health surface. **Nothing in this estate has watched a barrier move**, which is why every sentence here says `commanded` |
+| **call setup, audio and DTMF on real hardware** | Measured against baresip on a socket; never against an Axis, a 2N or any other door station, over a real garage's network |
+| **how long any of the windows should be** | `confirm_window_s` 90, `help_window_s` 60, `poll_seconds` 2, `decision_max_age_seconds` 120. All four are drawn from what people plausibly do and none is a measurement of what they do |
+
+**Install requirement, and this package cannot enforce it:** the intercom's own
+call list must name the AGENT FIRST and the human's number on no-answer. That is
+what makes a dead agent degrade to a plain intercom instead of to silence, and it
+is the whole of "a partial failure stays partial" at this seam. It is configured
+on the intercom, by whoever installs it.
+
+## The user agent is an install requirement, not a dependency
+
+SIP, RTP, DTMF and audio are an external user agent's job. This package is
+dependency-free and contains no SIP stack; it drives **baresip** over that
+program's `ctrl_tcp` control socket and holds only the dialogue state and the
+records. The version is read at startup and **a version this build was not
+tested against is refused** — the `schema_version` rule applied to a process,
+because a control vocabulary is not a versioned contract and a command that has
+grown a parameter is a call answered and then handled wrongly.
+
+Tested version: **baresip 4.11.0** (BSD-3-Clause). Debian and Ubuntu package
+older releases that do not carry the two modules this needs, so it is built from
+source at that tag on the target and on the CI runner.
+
+Seven things on the baresip side are load-bearing, and every one of them is
+configuration rather than code. **Four of them are now CHECKED, at startup, by
+reading the running process back** — `ctrl_tcp` answers `config` with the loaded
+settings, `modules` with the loaded module list, both from baresip's `debug_cmd`
+module (which is why that module is in the required list), and `reginfo` with
+every account it holds. The agent refuses to start on any of them, naming the
+setting or the intercom. Reproduce: `pytest -k baresip_configuration` and
+`pytest -k account`.
+
+| | checked at startup? | |
+|---|---|---|
+| `ctrl_tcp_listen 127.0.0.1:4444` | no — the agent reaches it, so it is on a socket by definition | Loopback. That socket can place a call, bridge two of them, and play audio at whoever is on the line. baresip's own default is every interface. |
+| `call_hold_other_calls no` | **yes**, read from `config` | baresip's default holds every other call when a new one is established, which would put the driver on hold the moment the agent calls the operator. |
+| an audio device that is **not** `aubridge` | **yes**, `audio_source` and `audio_player` read from `config` | baresip's own module documentation says what it is, verbatim: it "can be used to connect two audio devices together, so that all output to AUPLAY device is bridged as the input to a AUSRC device". That is every call bridged to every other one whether the agent asked or not. **What it then does to this agent is NOT MEASURED and no number here depends on it** — an earlier sentence claimed the operator heard the driver before `conference` was sent, and an independent session could not reproduce it. The refusal does not rest on that claim; it rests on what the module is. |
+| modules `ctrl_tcp`, `mixausrc`, `mixminus` (and `aufile`, `account`, `menu`, `debug_cmd`) | **yes** for the first three, read from `modules` | `mixausrc` is what plays one file into ONE leg; `mixminus` is what the bridge is; `debug_cmd` is what answers the two commands this check is made of. Without them the agent can answer a call and do nothing else. |
+| one account per declared intercom, named by its `dial_secret_file` | **yes**, read from `reginfo` at startup | It is what says which intercom a call is from. A missing one is refused by name — the intercom's name, never the secret's. |
+| `sip_cuser_random` **unset** | no — baresip 4.11.0 does not report it on `config` (measured; `filter_registrar` is in that output and this is not) | With it on, every account's contact user gets a random suffix and an INVITE aimed at the account's own user part is answered `404 Not Found` — measured, with the plain configuration as the control. **It fails CLOSED:** the intercom cannot get in at all, so this is a door that never works and never a door somebody else can open. |
+| **nothing else attached to that control socket** | no — it is not a setting | baresip's `ctrl_tcp` accepts exactly ONE client. A second connection — a console, a script, a monitoring tool — takes the agent's away. **The agent now REOPENS it:** see below. |
+
+### The control socket is reopened, and how long that takes is a setting
+
+A lost `ctrl_tcp` used to be a permanent outage. The socket was raised on and
+never replaced, so an ordinary `systemctl restart baresip`, a package upgrade, an
+OOM kill, or the second client above left the agent alive, its user agent
+registered, and every call ringing at a process that would never answer one —
+`ua_unreachable` `active` for the life of the process, with the only repair a
+human restarting the agent.
+
+`[user_agent] reconnect_seconds` (published default **5.0**, on `GET /v1/agent`)
+is the LONGEST gap between attempts to reopen it. The first retry is a quarter of
+a second away and the gap doubles up to the setting, so a service restart is
+recovered from in about a second and a user agent that is gone for good is not
+hammered once per poll for ever. `ua_unreachable` **recovers** on the reconnect.
+
+**What happens to the calls that were up.** Whatever case was in progress is
+gone — its legs were torn down or are beyond reach, and nothing can say what was
+said while nobody was listening — so the session is dropped with
+`case_not_spoken`, and every call the user agent is still holding is dealt with
+by the same rule any new call gets: one still **ringing** is answered, and
+anything else is released rather than left live to be conferenced into the next
+case.
+
+**One account per leg, and the legs are on different ones.** baresip identifies
+the audio stream to play into by the local account, so two calls on one account
+cannot be told apart — and the menu meant for the person on the phone would play
+to the driver at the barrier. The driver's leg sits on whichever intercom
+account the call arrived at (below); `[user_agent] operator_aor` is the one this
+agent dials OUT from, declared, and startup refuses it if it collides with any
+intercom's.
+
+## Which intercom a call is from
+
+**IT IS THE ADDRESS THE CALLER DIALLED. IT IS NOT WHO THE CALLER SAYS IT IS.**
+
+Each declared intercom gets an account of its own on the user agent, whose user
+part is a long random string the site generates once:
+`[intercoms.<sip-uri>] dial_secret_file` names a file holding it — a FILE, no
+default, and refused if anybody but its owner can read it, exactly like every
+other credential this package takes. The installer does three things once:
+writes the secret, adds `<sip:agent-<secret>@<the agent's host>>` to the user
+agent's own `accounts` file, and programs that same address into the door
+station as the number it calls. **A call is that intercom if and only if it
+arrived AT that account.**
+
+Why this and not the `From` header: baresip routes an inbound INVITE by the
+REQUEST-URI's user part and reports the account it chose on the control socket
+(measured on 4.11.0, with a registrar and without one), and the secret therefore
+never travels in a header a caller writes. It is the number dialled. A caller
+who asserts a declared door's own address of record — which used to be answered
+as that lane, ring a person, and write a complete authorisation record naming a
+barrier nobody was standing at — now reaches an account it cannot name, and the
+user agent answers it `404 Not Found` before this agent sees anything.
+
+**What this does NOT do, stated plainly because it is what an integrator needs
+to decide with.** A secret in a device's configuration is only as private as
+that device: anybody who can read the door station's own configuration can call
+as that door. That is a different exposure from a `From` header, which anybody
+on the same network can write without touching anything at all, but it is not
+nothing — and **nothing here measures it.** It is also not a secure channel:
+this is UDP SIP on the site's own network unless the site puts TLS under it, and
+a party that can READ the intercom's traffic can read the address it dials.
+What the mechanism removes is a party that can only SEND.
+
+`[intercoms.<sip-uri>] lane = "<lane name>"`, **per site, no default**, and
+startup refuses an intercom with no lane or a declared lane with no intercom. An
+agent that guessed which lane would be guessing which barrier somebody is
+standing at.
+
+**The table key is a LABEL.** It is what appears on events, on the read surface
+and in front of a person; it is what the `From` header is compared against for
+the record; and **nothing is routed on it.** It is recorded as
+`caller_stated_identity`, reduced by shape rather than character for character —
+a door station sends `"Door 1" <sip:door1@10.0.0.9:5060>;tag=…` on one call and
+the bare URI on the next, and two spellings of one claim would read as two
+callers.
+
+A call at an account no `[intercoms.*]` owns is **refused without being
+answered**. So is one the user agent refused itself. Both are an event
+(`call_from_undeclared_intercom`) and a code of the same name, carrying what the
+caller claimed to be and nothing else, because a claim is all there was. **No
+lane is read and none is guessed**, and nothing is played: this version has no
+sentence for a caller it cannot place, because answering one means speaking to
+somebody about a barrier it would have to guess at.
+
+**That is what happens when the agent is not already on a case.** The account is
+looked at only then — see "One case at a time" below: a live case refuses every
+new call, whoever it is from, before anybody's identity is read.
+
+**Startup refuses an intercom whose account the user agent is not holding**,
+naming that intercom and never the secret. Without it, a door the installer
+added to this file and forgot to add to the user agent's would be answered
+`404 Not Found` by baresip and reported nowhere, while this agent published a
+working surface.
+
+**`lane = "none"` is STANDALONE**, and it is a mode rather than a degraded
+configuration: a garage with an intercom and no lane is the whole product for
+that site, and every call there is a human case from the first second.
+`[lanes.none]` is refused by name so that one spelling cannot mean two things.
+
+## One case at a time
+
+`concurrent_cases` on `GET /v1/agent` is **1**, and it is a real limit rather
+than a policy: the user agent's bridge is site-wide, so a second case bridged
+while the first is open would put two strangers and two operators into one
+conversation.
+
+A call arriving during a case is **refused without being answered**, whoever it
+is from — the identity is not looked at first, because being undeclared is the
+default state of every caller on a network and the limit has to hold against all
+of them.
+
+**What the refusal IS, measured from the caller's side:** the agent hangs the
+unanswered call up, and baresip sends **`486 Busy Here` after `180 Ringing`**.
+That is read out of a second caller's own user agent, not out of ours. It is
+recorded as `call_refused_busy`, with the caller's identity on the record.
+
+**Whether a door station's call list advances on a `486` — rather than only on a
+no-answer timeout — is NOT MEASURED.** It is a property of an Axis or a 2N unit,
+and this package has never been run against either.
+
+## The case set, and how it is derived
+
+The case is a **pure function of what the lane published** — `GET /v1/lane/state`
+and `GET /v1/lane/health`, GET only, with the timeout that lane's target
+declares. It is **derived and never asked**: a driver at a barrier does not know
+whether the identification service is down or their plate was marginal, and a
+menu offering them the choice would be a guess with a keypad.
+
+The order matters and is part of the contract. Standalone first, because there is
+no lane to ask. Then whether the lane could be read at all. Then a malfunction,
+because a broken lane's last decision is not a fact about the vehicle standing at
+it. Then a lane its owner has CLOSED (`lane`): it opens for no car by
+itself, only a person's word opens it, and a ticket is not offered there — the
+lane refuses a display code at a closed lane. Then the outcome — and the transit decides something only under `allow`,
+because under `deny` and `no_vehicle` there was no vend for closing loops to have
+confirmed.
+
+| the lane says | case | ends with |
+|---|---|---|
+| any malfunction `active` whose `never_alarm` is `false` on the wire | `malfunction_active` | a person |
+| `lane.state: closed` — the lane's owner closed it, to everyone or because the garage is full — whatever the decision was | `lane_closed` | a person, and **no ticket is offered** |
+| `outcome: fallback`, `reason: lane_closed` | `lane_closed` | a person |
+| `outcome: fallback`, `reason: engine_unreachable` | `identification_unavailable` | a person |
+| `outcome: fallback`, `reason: no_plate_read` | `plate_not_read` | the instruction, then a person |
+| `outcome: fallback`, `reason: low_confidence` | `plate_unclear` | the instruction, then a person |
+| `outcome: fallback`, `reason: unknown_vehicle` | `vehicle_not_recognised` | a person |
+| `outcome: fallback`, `reason: stale_rules` | `rules_unavailable` | a person |
+| `outcome: deny` | `entry_refused` | a person |
+| `outcome: no_vehicle` | `vehicle_not_detected` | a person |
+| `outcome: allow`, transit `held` or `unconfirmable` | `entry_not_confirmed` | a person |
+| a decision whose `decision.at` is older than `[cases] decision_max_age_seconds` | `stale_decision` | a person |
+| a decision whose `decision.at` is missing, unparseable, or carries no timezone | `unrecognised_reason` | a person |
+| a `reason` outside the required subset, a decision the lane has not made, or any other answer this build will not interpret | `unrecognised_reason` | a person |
+| the lane did not answer, refused us, or speaks a version this build cannot read | `lane_unavailable` | a person |
+| `lane = "none"` | `standalone` | a person |
+| `outcome: allow`, transit `confirmed` or `pending` | `nothing_to_do` | one message, and the call ends |
+
+**`identification_unavailable` never mentions the plate.** A dead identification
+engine and a marginal read used to arrive as the same code; telling somebody to
+clean a number plate that nothing looked at is the standing acceptance of this
+project broken in the module's first sentence.
+
+### The decision has an AGE, and a stale one never ends a call
+
+`GET /v1/lane/state` publishes `decision.at`. The agent reads it, and the case
+function is given a clock, so the age of the decision is checked **before any
+outcome branch** — a decision the lane made for somebody else is not a fact about
+the driver standing at the barrier now, whatever it said.
+
+`[cases] decision_max_age_seconds`, per site, **published default 120**. It is a
+SETTING AND AN ASSUMPTION, and that is said rather than implied: **nothing has
+measured how long a lane decision stays the same car's.** Two minutes is drawn
+from a person walking from a stopped car to a door station and pressing a button,
+which is a guess about people and not a measurement of them. What is not a guess
+is which way the error falls — past the bound the driver gets a person, which is
+what every other case in the set already gets.
+
+**This is the only guard in front of `nothing_to_do`**, and `nothing_to_do` is
+the one case in the whole set that reaches nobody. Before it existed, a lane
+whose last decision was an hour-old `allow`/`confirmed` — which is exactly what a
+presence gate that does not arm leaves behind — told the next driver "this
+entrance has nothing outstanding for you" and hung up on them. `nothing_to_do` is
+now reachable only from a FRESH `allow` with transit `confirmed` or `pending`.
+
+> This is a COMPARISON ACROSS TWO CLOCKS: `decision.at` is read from the LANE's
+> clock and `now` from this process's. It is not a measured age. A NEGATIVE AGE
+> IS REACHABLE — a decision stamped after the moment this process reads it — and
+> it is treated as FRESH, because the alternative is sending a driver to a person
+> on the strength of a clock offset nobody has measured. Nothing here measures
+> the offset between the two, so nothing here can separate it from the age it is
+> trying to read. Where the two clocks are the same box, or are disciplined to
+> the same source, this is the cost of being a CONSUMER of the lane's contract
+> rather than something the lane calls.
+
+That sentence lives in `cases.DECISION_AGE_NOTE`, is published here from that one
+copy, and a value test holds the two together: editing either goes red. It is the
+capture process's `capture_minus_lane_event_ms` note applied to this field, and
+for the same reason.
+
+**A `decision.at` this build cannot read is `unrecognised_reason`, not fresh.** A
+missing stamp, one that does not parse, and one with no timezone all fall to the
+catch-all — the timezone rule, and the same reason: a naive moment compared
+against an aware one is a guess about which machine it came from.
+
+**`vehicle_not_detected` is the case the intercom exists for.** The presence gate
+is unvalidated on real vehicles, and a real car it wrongly refuses has no other
+recourse: there is a driver at the barrier and the lane believes the lane is
+empty.
+
+**An unrecognised reason ESCALATES and is never mapped onto the nearest thing we
+know.** A lane that is not ours has its own vocabulary and will emit it. The lane
+contract requires a consumer to escalate on one it does not recognise, and this
+is that requirement implemented.
+
+`reason` is the one set the lane contract does **not** publish, so the required
+subset is a copy held in `cases.REQUIRED_FALLBACK_REASONS` and compared against
+the installed lane package by a test, in both directions.
+
+## Languages
+
+`[languages] driver = [...]` and `operator = "..."`, **declared per site, no
+default**, and startup refuses either if it is empty or names a language this
+build has no lines for.
+
+**The driver has no keypad**, so every sentence they hear plays in EVERY declared
+driver language, in the declared ORDER, one after the other. The person on the
+phone hears the operator language only; they are staff, and a menu played twice
+is a menu somebody keys over.
+
+**The language is PER CALL and can narrow mid-call.** The rule: if the
+customer starts speaking in Spanish rather than English, the call continues in
+Spanish from there. One function does it — `Agent.set_language(call, language)` — and from
+the next sentence on, that call is spoken in that language and no other. A
+language the site did not declare is **refused**, not accepted and then found to
+have no audio: a switch that silently did nothing would leave a driver being
+spoken to in a language they have just said they do not have.
+
+**What NOTICES they switched is not in this version.** Hearing a language is
+automatic speech recognition, which is a later step and is gated on a
+measurement of narrowband SIP audio nobody has made. What is here is the state
+that step will set, so that step adds a detector and nothing else.
+
+**Every string is a value in the repository, per language, tested**, and the
+audio file for it is a file the package installs whose name derives from the
+line's key and the language. **A line with no words in a declared language, or
+no audio file, refuses startup** — not skipped, not substituted, not played in
+another language, because a driver who hears silence at a barrier has been told
+nothing and cannot tell it from a dead intercom.
+
+This version ships **English and Spanish**, end to end: text, audio, and the
+mechanism proven with two rather than described with one.
+
+### Where the audio comes from
+
+Every file is produced by `scripts/build_audio.py` from the text in
+`lines.TEXT`, and `audio/MANIFEST.json` records, per file, the exact text it was
+made from, its digest, its voice and its licence — so a sentence edited without
+regenerating its audio goes red rather than shipping a file that says the old
+thing.
+
+The synthesiser is **eSpeak NG** (GPL-3.0-or-later). It was chosen for the
+licence and not for the voice. The obvious alternative was disqualified by the
+licence of its **recorded corpus** — research use only, no redistribution — and
+eSpeak NG has no corpus at all: its own README says it "is not as natural or
+smooth as larger synthesizers which are based on human speech recordings", which
+is the same sentence read as a licence fact. It is machine speech. It is
+intelligible at 8 kHz over a narrowband call, which is the property this job
+needs, and a site that wants a voice replaces the files — the manifest records
+what each one has to say.
+
+**Who wrote the WORDS, and from what**, is a row per language in the manifest —
+`text_provenance` — and every file names its row. The manifest recorded the
+voice, the tool and the tool's licence for the AUDIO and nothing at all about the
+TEXT, which is the thing the audio is only a rendering of. Both rows say what was
+NOT done as plainly as what was: the English and the Spanish were written by the
+software that wrote the rest of this package, and neither has been through a
+professional editor, a translation service, or a native speaker.
+
+**The Spanish ships as `es-ES`, not `es`.** It is Castilian — `matrícula`,
+`aparcamiento`, `Pulse` — and under a generic tag a garage in
+Texas or Bogotá would declare "Spanish", get this, and hear several words that
+are wrong for its drivers. A regional tag is the one thing that makes that
+visible in the site's own configuration file.
+
+The name of a DOOR is not in this repository and cannot be: `[intercoms.<uri>]
+name_audio` is a file the SITE supplies, played to the person on the phone
+before the case, and startup refuses an intercom without one. It is also the one
+audio file this package does not produce, so it is the one whose properties are
+checked rather than known: **8 kHz, mono, 16-bit** like everything else the agent
+plays, and no longer than `[speech] name_audio_max_seconds` (published default
+**10.0**). The person's briefing waits for the whole of it, and a driver at the
+barrier waits for the briefing.
+
+### A line that cannot be played is a code, a timer and a true record
+
+Playing a file can be REFUSED by the user agent. Usually that is benign and a
+fifth of a second from resolving — the call's audio stream has not come up yet —
+so the line is kept and retried. What had no answer was the other cause: a file
+the user agent will not decode, an audio mode it will not play into, a mixer
+stuck in a mode it cannot leave. Retried for ever, that is a driver in an
+answered call hearing nothing, with no timer, no code, and a log saying their
+case was spoken. **Measured on this build: thirty-three hours of it, and a clean
+health surface throughout.**
+
+`[speech] line_timeout_seconds`, per site, **published default 10.0**. The clock
+starts when a line becomes DUE rather than when it is first refused, because a
+leg whose media never comes up is never even attempted and to the driver that is
+the same silence. Past it:
+
+| the leg | what happens |
+|---|---|
+| the driver's | `audio_playback_failed` `active`, subject `driver`. The case is still a case, so it goes to **the person** — briefed the same way, and timed the same way. |
+| the person's | `audio_playback_failed` `active`, subject `operator`. Nothing is left that can tell anybody anything, so the case ends with **`case_not_spoken`** and the driver's call is RELEASED rather than held open in silence. |
+
+`SPEAKING_CASE` and `BRIEFING` are both bounded by this. Neither used to be:
+both advanced only on a leg falling silent, which a queue that never drains never
+does.
+
+**`case_spoken` is written when the last file of the case has FINISHED playing**,
+never when it is queued. It used to be written at the moment the first file was
+put on the queue, which is a claim about a queue — and it stayed true in the log
+through the thirty-three hours above.
+
+> **The finish is timed from the file's own measured duration, not from a signal
+> the user agent sends, and that is a MEASUREMENT rather than a choice.** baresip
+> 4.11.0 emits **no** playback-complete event for `mixausrc_enc_start`, the verb
+> every sentence here is played with: its `mixausrc` module logs the end of a
+> file at debug level and raises no `bevent`, and `BEVENT_END_OF_FILE` is emitted
+> only from the call's own audio-device error handler, which this path does not
+> go through. Measured on a live call, with the positive control that DTMF events
+> arrived on the same drained control socket in the same window. The duration is
+> read out of each file at startup, which is a property of something this package
+> ships and can measure.
+
+## The person, the bridge, and the authorisation set
+
+`[escalation] human_sip_uri` is declared, with no default.
+
+The agent places a **second call** to that address and stays in both. Before
+bridging it plays the person the intercom's `name_audio` and the case in the
+operator language — **the lane and the case, and nothing else. No plate.** This
+agent never reads a plate: `GET /v1/lane/state` carries `read_ref` and not a
+plate, and this package does not read even that, so there is none here to leave
+out.
+
+Then the menu, then the bridge. Everything before the bridge is private to one
+leg, which is what lets the person be told the case without the driver hearing
+it.
+
+**The digits are fixed and published**, and a site enables a subset rather than
+renumbering the set — the person keying it is often the same person across
+several garages at three in the morning, and a mapping that moved between sites
+would be a wrong decision made by muscle memory.
+
+| digit | authorisation | what it does in THIS version |
+|---|---|---|
+| 1 | `open_now` | **commands a vend** at that lane, with `authorised_by = human_open_now` — the only authority the lane accepts on a `deny`, recorded there as an override. Standalone, it pulses that intercom's own relay. Where nothing can act, the person hears the one fixed sentence saying so |
+| 2 | `open_and_flag` | the same, with `human_open_and_flag`, which does **not** override a rule |
+| 3 | `do_not_open` | records it; the driver is told |
+| 4 | `hold` | records it, and the driver is re-prompted every `hold_reprompt_seconds` |
+| 5 | `transfer` | records it. Needs `[escalation] transfer_sip_uri`, and startup refuses the pair otherwise rather than quietly not offering an option a site switched on |
+
+**6 is not assigned, and is not to be reassigned.** It was `call_back` — a
+call-back number keyed and ended with `#` — until **2026-10-31**, when it was
+removed. A person who keys 6 from
+habit is re-prompted exactly as for any other digit this site has not enabled:
+nothing is recorded as an authorisation and no number is collected after it. A
+configuration that still names `call_back`, true or false, is refused at startup
+by name. `call_back` may still appear as the `authorisation` of a record written
+before then, with its number in `keyed`; readers of the store accept it there.
+
+`[authorisations]` is a block of booleans, **no default**, and a site that
+enables none is refused: a person called who can authorise nothing has been rung
+for nothing. **Only what is enabled is offered**, and a digit outside the enabled
+set is re-prompted twice and then treated as nothing usable — never mapped onto
+the nearest enabled thing.
+
+**Nothing keyed while a re-prompt is playing counts.** From an unknown digit
+until "I did not get that" and the menu have finished playing on the person's
+leg, every digit that arrives is dropped unread — and so after an open the lane
+refused, while the refusal and the menu are read again. Only a digit keyed after
+that is acted on. Without it, a person who keys 6 from habit and then a phone
+number would have the number read as menu choices, and a 1 in it is `open_now`.
+Dropped digits are not held against the person's two re-prompts, and the call
+record counts them (`digits_ignored`) — the count, never the digits.
+
+**Two timers, both per-site settings with published defaults, and both
+assumptions** — nothing here measures how long a person takes to reach a phone:
+
+- `no_answer_seconds`, default **30.0** — the person did not pick up. The driver
+  is told, `human_unreachable` is recorded and the code of the same name goes
+  `active`.
+- `nothing_usable_seconds`, default **20.0** — no digit this site accepts. Same
+  shape.
+- `hold_reprompt_seconds`, default **45.0** — how often a driver on hold is told
+  they are still on hold, because silence on a door station is indistinguishable
+  from a dead intercom.
+
+## `GET /v1/agent` — who it is, and what it answers
+
+<!--payload:agent-->
+```json
+{
+  "agent_id": "agent-1",
+  "site_id": "site-1",
+  "contract_version": 2,
+  "can_vend": true,
+  "intercoms": [
+    {
+      "sip_uri": "sip:door1@10.0.0.9",
+      "lane": "entry",
+      "has_display": true,
+      "has_relay": false
+    }
+  ],
+  "lanes": [
+    {
+      "name": "entry",
+      "can_vend": true
+    }
+  ],
+  "user_agent": {
+    "kind": "baresip",
+    "version": "4.11.0",
+    "reconnect_seconds": 5.0,
+    "tested_versions": [
+      "4.11.0"
+    ],
+    "registered": true
+  },
+  "languages": {
+    "driver": [
+      "en",
+      "es-ES"
+    ],
+    "operator": "en"
+  },
+  "authorisations": [
+    "open_now",
+    "open_and_flag",
+    "do_not_open",
+    "hold"
+  ],
+  "event_window_depth": 256,
+  "concurrent_cases": 1,
+  "escalation": {
+    "no_answer_seconds": 30.0,
+    "nothing_usable_seconds": 20.0,
+    "hold_reprompt_seconds": 45.0,
+    "transfer_declared": false
+  },
+  "cases": {
+    "decision_max_age_seconds": 120.0
+  },
+  "speech": {
+    "line_timeout_seconds": 10.0,
+    "name_audio_max_seconds": 10.0
+  },
+  "records": {
+    "retention_days": 400,
+    "max_bytes": 268435456
+  }
+}
+```
+
+`user_agent.version` is what the UA reported about itself and is `null` before it
+has answered once; `tested_versions` is what this build will start on. The
+control socket's address is **not** published: it is a local socket, and
+publishing where a process's control channel lives is publishing a way in.
+
+`authorisations` is what this site enabled, in the order of the closed set.
+
+## `GET /v1/agent/health` — every code, every time
+
+<!--payload:agent_health-->
+```json
+{
+  "contract_version": 2,
+  "codes": [
+    {
+      "code": "sip_registration_lost",
+      "subject": "sip:agent@10.0.0.20",
+      "state": "ok",
+      "source": "measured",
+      "never_alarm": false
+    }
+  ],
+  "records": {
+    "held": null,
+    "bytes_used": null,
+    "max_bytes": 268435456,
+    "retention_days": 400,
+    "oldest_at": "2026-09-02T07:40:19+00:00",
+    "newest_at": "2026-10-30T22:16:40+00:00",
+    "cursor": 512,
+    "purged_for_age": 0,
+    "dropped_for_space": 0,
+    "last_dropped_at": null,
+    "dropped_through": null,
+    "unreadable": 0,
+    "writable": true
+  }
+}
+```
+
+`records` is the call-record store as READS — the same block, in the same words,
+as `records` on `GET /v1/monitor/health`.
+
+Entries are in the **lane's shape** — `state`, `source`, `never_alarm` on the
+wire — so a monitor reads this with the code that already reads a lane and a
+capture process. One reader, one passthrough rule, and no third dialect for
+`never_alarm` to be read wrong in.
+
+One entry per `(code, subject)`, and **every member of the set ships on every
+response**: a code that is absent reads to a consumer exactly like a code that is
+fine. A code with no subject yet ships once, `unknown`, under this agent's own
+id, and `lane_unavailable` ships once per **declared** lane whether or not a call
+has been taken at it.
+
+| code | subject | what it means |
+|---|---|---|
+| `sip_registration_lost` | this agent | **This is the lane contract's `intercom_registration_lost`, measured where it can be measured.** A lane cannot see whether the agent is registered; the agent can. Both documents say so, in the same words. The subject is the agent rather than an account: it holds one account per intercom now and their user parts are the dial secrets, so naming them here would publish every one of them. Any account the user agent reports in error makes this `active`. `unknown` until the UA has said something — including the whole of a standalone site, which has no registrar to register with — because a registration nobody has heard about is not one known to be lost, and publishing the second pages somebody to a working site |
+| `ua_unreachable` | this agent | the user agent's control socket did not answer. The agent is up and cannot answer a call |
+| `ua_unsupported_version` | this agent | the UA is a version this build was not tested against |
+| `call_from_undeclared_intercom` | this agent | a call arrived at an account no `[intercoms.*]` owns, or the user agent refused one outright because it named no account it holds. **The subject is the agent and not the caller**: the caller's identity is a string the caller wrote, so keying the code on it would let anybody who can dial this agent add a row per identity they invented. It clears when a call at a DECLARED account is answered — which is a measurement, not a timer — and is `unknown` until either happens |
+| `human_unreachable` | the escalation address | the person did not answer inside `no_answer_seconds`. **It recovers**: the next call they answer clears it, because a code that could only ever go one way is a latch that reads like a state |
+| `audio_missing` | the line, or the file | a file the agent reaches for is not there. Startup refuses on this, so on a running agent it is a file that has gone missing since |
+| `lane_unavailable` | the lane's name | per declared lane |
+| `record_store_unwritable` | this agent | the durable record of a call could not be written. The call goes on; the gap in the account is said here |
+
+Nothing here is `never_alarm`: every member is a reason somebody at a barrier
+cannot be helped.
+
+## `GET /v1/agent/events?since=N` — what it did
+
+<!--payload:agent_events-->
+```json
+{
+  "contract_version": 2,
+  "cursor": 2,
+  "reset": false,
+  "dropped": 0,
+  "events": [
+    {
+      "cursor": 1,
+      "kind": "call_answered",
+      "site_id": "site-1",
+      "agent_id": "agent-1",
+      "intercom": "sip:door1@10.0.0.9",
+      "lane": "entry",
+      "case": null,
+      "authorisation": null,
+      "human": null,
+      "at": "2026-08-30T14:00:00+00:00",
+      "keyed": null,
+      "caller_stated_identity": "sip:door1@10.0.0.9",
+      "released": null,
+      "ticket_id": null,
+      "authorised_by": null,
+      "code": null,
+      "reason": null,
+      "lane_event_cursor": null,
+      "relay_port": null,
+      "relay_ms": null,
+      "cause": null,
+      "display": null,
+      "geometry": null
+    }
+  ]
+}
+```
+
+The same cursor shape and the same semantics as the lane's, the monitor's and the
+capture process's, field for field, so one consumer holds one policy for all of
+them — and it is unchanged by the call record below, which keeps every one of
+these events on the call it belongs to: monotonic within one run, not durable
+across a restart, `reset` when
+`since` is ahead of the cursor or behind the oldest event still held, and
+`dropped` counting what the window evicted.
+
+**There is no field here for a plate, and there is no plate to put in one.**
+`keyed` is **always `null` from this version**: it carried the call-back number
+keyed with `call_back`, which was removed on 2026-10-31, and no authorisation
+left carries a value. The field is kept rather than dropped so a consumer written
+against it keeps working, and it is still **digits only, refused otherwise**,
+because a field a caller fills is the field a plate ends up in.
+
+`intercom` and `human` are addresses a site declared, not people: this surface
+says which door and which rota, and whoever wants to know who was on shift asks
+the rota. `intercom` is the site's own LABEL for the door — the
+`[intercoms.<sip-uri>]` key — and on a refusal it is this agent's id, because
+there is no door to name.
+
+**`caller_stated_identity` is a CLAIM and its name says so.** It is the `From`
+header of the call, reduced to `sip:user@host`. Anybody who can send an INVITE
+can write any value in it, so nothing is decided by it: what identified the
+intercom is the ACCOUNT the call arrived at, which never appears on this surface
+because its user part is a secret. On a refusal it is the whole record of who
+tried, and it is worth exactly what a stranger's word is worth.
+
+## `GET /v1/agent/calls` — every call it handled, kept
+
+The intercom half of the same account: when a car leaves unpaid, the platform's
+exception wants every call at that lane in the window — who called, who was
+rung, who answered, what they keyed. The events route holds those for one run
+and a bounded window; this holds them for `[records] retention_days`.
+
+**Every call the agent handles is one record**, answered or refused, written at
+every step it takes — answered, case spoken, person rung, person answered,
+authorisation keyed, vend asked for or refused, ended — so a crash leaves the
+steps that happened. A call the last run was on when it stopped is closed at the
+next start as `interrupted_by_restart`, with `ended_at` left `null`: nothing
+here knows when it ended. A relay's outcome that arrives after its call has
+ended goes onto THAT call's record, never onto whichever call is live by then.
+
+The store, its revision cursor, its two bounds and the page are **the same as
+the monitor's messages**, in the same words — one implementation, `records.py`
+— with `[records]` declared in the agent's own configuration, `retention_days`
+default 400 and `max_bytes` default 268435456, counted under `records` on
+`GET /v1/agent/health`. The query takes the same five parameters and refuses
+the same things; `from`/`to` are on `started_at`; and `lane` is **the agent's
+own name for the lane** — the `[lanes.<name>]` the dialled account's intercom
+declares, which is what identified the call. It is not the lane's `lane_id`;
+a site maps one to the other once, in its own configuration. As on the
+messages route, `lane` also matches every record with `lane: null` — the calls
+refused before anybody knew which door they were.
+
+<!--payload:calls-->
+```json
+{
+  "contract_version": 2,
+  "cursor": 12,
+  "more": false,
+  "reset": false,
+  "gap": false,
+  "query": {
+    "since": 0,
+    "lane": "entry",
+    "from": "2026-10-30T21:00:00+00:00",
+    "to": "2026-10-30T23:00:00+00:00",
+    "limit": 100
+  },
+  "calls": [
+    {
+      "call_id": "c-0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+      "revision": 12,
+      "site_id": "site-1",
+      "agent_id": "agent-1",
+      "disposition": "answered",
+      "intercom": "sip:door1@10.0.0.9",
+      "lane": "entry",
+      "caller_stated_identity": "sip:door1@10.0.0.9",
+      "started_at": "2026-10-30T22:16:40+00:00",
+      "case": "identification_unavailable",
+      "case_spoken_at": "2026-10-30T22:16:52+00:00",
+      "person_called": "sip:duty@10.0.0.5",
+      "rang_person_at": "2026-10-30T22:16:52+00:00",
+      "person_answered_at": "2026-10-30T22:17:01+00:00",
+      "person_answered_as": "sip:duty@10.0.0.5",
+      "authorisation": "do_not_open",
+      "authorisation_at": "2026-10-30T22:17:30+00:00",
+      "keyed": null,
+      "ticket_id": null,
+      "ended_at": "2026-10-30T22:17:38+00:00",
+      "outcome": "authorisation_received",
+      "recording": null,
+      "digits_ignored": 0,
+      "events": [
+        {
+          "kind": "call_answered",
+          "site_id": "site-1",
+          "agent_id": "agent-1",
+          "intercom": "sip:door1@10.0.0.9",
+          "lane": "entry",
+          "case": null,
+          "authorisation": null,
+          "human": null,
+          "at": "2026-10-30T22:16:40+00:00",
+          "keyed": null,
+          "caller_stated_identity": "sip:door1@10.0.0.9",
+          "released": null,
+          "ticket_id": null,
+          "authorised_by": null,
+          "code": null,
+          "reason": null,
+          "lane_event_cursor": null,
+          "relay_port": null,
+          "relay_ms": null,
+          "cause": null,
+          "display": null,
+          "geometry": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Every field of a call:**
+
+| field | |
+|---|---|
+| `call_id` | `c-` and 32 hex digits. |
+| `revision` | The store's counter at this record's latest write. |
+| `disposition` | `answered`; `refused_busy` (a case was in progress — `486 Busy Here`, unanswered, and nobody looked at who it was); `refused_undeclared` (an account no intercom declares, or one the user agent refused itself). |
+| `intercom` | The site's LABEL for the door — the `[intercoms.<sip-uri>]` key. This agent's id on a refusal: there is no door to name. |
+| `lane` | The agent's lane name, from the dialled account. `null` for a refusal and for a standalone door. |
+| `caller_stated_identity` | The `From`, reduced by shape. A CLAIM, and named as one: nothing is decided by it. |
+| `started_at` | When the call was answered, or refused. |
+| `case`, `case_spoken_at` | What the driver was told, and when the last file of it FINISHED. `null` where the driver was told something else — a ticket on the screen. |
+| `person_called`, `rang_person_at` | The `[escalation] human_sip_uri` that was dialled, and when. An ADDRESS, not a person. |
+| `person_answered_at`, `person_answered_as` | When that leg was answered, and the address the user agent reported for it — **the leg's address, not a person**. A rota that rings three handsets answers as the rota; nothing here can see which handset, or who held it. Whoever needs a name asks the rota for who was on shift at `person_answered_at`. |
+| `authorisation`, `authorisation_at`, `keyed` | What the person keyed, and when. `keyed` is **always `null`** from this version (`call_back`, digit 6, was removed on 2026-10-31); a record written before then may still carry `authorisation: "call_back"` and the number in `keyed`, and is read as written. |
+| `ticket_id` | The ticket this call confirmed, was told about, or whose vend it asked for. |
+| `ended_at` | When the call ended. `null` while it is live, and on `interrupted_by_restart`. |
+| `outcome` | `null` while live; then one of `authorisation_received`, `human_unreachable`, `nothing_usable`, `operator_hung_up`, `ticket_confirmed`, `told_ticket_on_screen`, `nothing_to_do`, `case_not_spoken`, `user_agent_lost`, `driver_hung_up`, `interrupted_by_restart` — set where the agent KNOWS it, never inferred afterwards. A refused call's outcome is its disposition. |
+| `digits_ignored` | How many digits the person keyed while a re-prompt was still playing, which were dropped unread — see the authorisation set. A **count, never the digits**. **Absent** on a record written before 2026-10-31, which did not count them: records are served as they were written, and a reader treats a missing `digits_ignored` as 0 (this package's own reader does). |
+| `recording` | **`null`. This version records no audio**: the user agent is not configured to record and nothing here asks it to. The field is here so the round that does fills it. |
+| `events[]` | Every agent event this call produced, exactly as `GET /v1/agent/events` serves it — vend asked for or refused, relay pulsed or not, with their codes. |
+
+`person_answered_as` comes from the user agent's own report on the answered leg,
+measured against a real baresip in `tests/test_agent_sip.py`.
+
+## Running it
+
+```sh
+gate-agent agent --config agent.toml
+```
+
+Binds `127.0.0.1:8094`. **Local by design.** `[records] directory` follows the
+monitor's rule: a published default, one warning when it is used, a refusal only
+for a declared directory that cannot be used or a store another agent holds. Off loopback it refuses to start
+without a credential — the same rule and the same words as the other two
+surfaces, imported rather than restated. The exposure here is its own kind: this
+publishes which intercoms a site has, which of its lanes cannot be read, and when
+a person was called and did not answer, which is a timetable of when nobody is
+watching a garage.
+
+## What is NOT here, stated rather than left to be discovered
+
+- **No act ROUTE on this surface.** `GET /v1/agent`, `/health`, `/events` and
+  `/calls`, and every other method is one shared `405`. The agent COMMANDS a vend as a
+  CLIENT of the lane's contract; nothing that can reach this port can make it.
+- **No SMS.** A driver with no phone camera, or a display that refused, reaches
+  a person. Sending a message needs a provider account, which is a decision
+  somebody makes and not a line of code.
+- **No EXIT.** Nothing here reads a ticket back. The format is versioned and its
+  verifier ships beside its signer (`tickets.verify`), so the round that builds
+  an exit calls that function rather than writing a second reading of one
+  format.
+- **No relay but Axis.** 2N and Akuvox are named, not built.
+- **No voice recognition.** Nothing here listens to what a driver says; the case
+  is derived from the lane, never asked.
+- **No state store for a case.** The event window is a catch-up buffer, and a
+  case in progress is lost at a restart. What a CALL was is kept — see
+  `GET /v1/agent/calls` — and a call record is never read back to resume one.
+- **No recording of a call's audio.** `recording` on a call record is `null`.
+- **No measurement of a real intercom.** Stated at the top of this section, and
+  it is the sentence to read before any of the others.

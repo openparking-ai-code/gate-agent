@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openparking-gate-agent"
+version = "0.1.0"
+description = "Open Parking AI gate agent — the malfunction monitor: watch a lane, tell a human"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+# NOTHING. Standard library only, and that is a property rather than a
+# convenience: this runs beside a lane, on a box in a gate housing, and it is
+# the process that has to still be alive when the thing it watches is not.
+#
+# `lane-controller` is deliberately NOT here. This module is a CONSUMER of the
+# lane contract -- the seat a third party takes -- so it speaks HTTP to that
+# contract and imports none of it. `tests/test_no_opening_authority.py` enforces
+# that against the package source and fails if it is ever untrue.
+dependencies = []
+
+[project.optional-dependencies]
+# `openparking-lane-controller` is a TEST dependency and only a test dependency.
+# The suite reads a REAL lane through the contract, over a socket, beside a
+# foreign lane written from the document -- and a fixture that pretended to be
+# our lane would prove nothing about the seat. Pinned to a commit on that
+# repository's `main`, not to `@main`: a moving target on the other side of a
+# contract boundary means this module's tests can change meaning without a
+# commit here.
+# `opencv-python-headless` is here for ONE JOB: it is the INDEPENDENT DECODER
+# that proves the QR encoder in `src/gate_agent/qr.py`. An encoder nobody can
+# read back is a picture of a QR code, so the suite requires something that is
+# not this repository to read every symbol it builds. Headless because a test
+# runner has no display and the GUI build pulls in a window toolkit.
+#
+# LICENCE: Apache-2.0 (OpenCV 4.5.0 and later; the project relicensed from
+# BSD-3-Clause). It is a TEST dependency and appears nowhere in `src/` --
+# `dependencies = []` above is the property, and `tests/test_no_opening_authority.py`
+# and `tests/test_qr.py` both rest on this one not being a runtime import.
+dev = [
+  "pytest>=8",
+  "ruff>=0.8",
+  "opencv-python-headless>=4.10",
+  "openparking-lane-controller @ git+https://github.com/openparking-ai-code/lane-controller@00a74ba2fa000cf537840da81e620dd9163d80f3",
+]
+
+[project.scripts]
+# The standalone face of the module. Standalone is a MODE: with no lane
+# declared it watches whatever is declared, and with nothing declared it
+# refuses to start rather than report that nothing is wrong.
+gate-agent = "gate_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The audio the agent plays is PART OF THE PACKAGE, not a repository asset that
+# happens to sit beside it. A file the agent refuses to start without cannot be
+# something `pip install` leaves behind, and a site's operator has no way to know
+# that ninety files were meant to arrive.
+gate_agent = ["audio/*/*.wav", "audio/MANIFEST.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "tests"]
+# `sip` marks the tests that drive a REAL baresip against a real registrar over
+# real sockets. They are the only measurements in this suite that touch SIP at
+# all, and CI runs them with REQUIRE_SIP=1 -- which turns a missing baresip into
+# a failure rather than a skip, because a guarantee test that can skip silently
+# is not a guarantee.
+markers = ["sip: drives a real SIP user agent over real sockets"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

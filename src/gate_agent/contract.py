@@ -1,0 +1,2813 @@
+"""The monitor contract. This module IS the monitor's public read surface.
+
+Everything else in this package is an implementation detail that may be
+rewritten; the payloads below are not. They are versioned from the first release
+so a change to them is always visible as one, and they follow the same
+compatibility policy the lane contract and the Vehicle ID contract state, in the
+same words, so one consumer can hold one policy for all three.
+
+**This surface is READ ONLY, and the MONITOR behind it has no opening authority
+at all.** The monitor reads GETs and sends messages. It never calls a vend,
+never resolves a transit, and never writes to a lane -- the monitor holds no
+client capable of a method other than `GET`, and that is swept rather than
+promised. A monitor that could act would be a new route to a barrier, which is
+the boundary every outside reviewer of this project has named.
+
+**Said of the MONITOR, not of the package.** From contract version 2 the AGENT -- the third
+process here, under this same `contract_version` -- can command a vend at a lane
+a site gave it an act token for. That is described where it happens, under "IT
+CAN NOW COMMAND A VEND" in `docs/CONTRACT.md`. The sweep that walks every module
+for a request that is not a `GET` still runs; it exempts `act.py` and the webhook
+sink by name and nothing else, so a monitor module that grew one would go red.
+
+Four properties are the whole point, and each is enforced below rather than
+described and hoped for:
+
+  * **A state nobody derived is `unknown`, never `ok`.** `MonitorEntry` refuses
+    `ok` or `active` from a code this build does not derive, exactly as the lane
+    contract's `HealthEntry` does. A monitor that reports a clean bill of health
+    for something it never measured is the one lie this module exists to
+    prevent.
+
+  * **A target's codes are PASSED THROUGH.** The state and the source a target
+    published are what this surface publishes. Not re-derived, not re-labelled,
+    not translated into our vocabulary. A monitor that re-stated a lane's health
+    in its own words would be a second copy of a claim, and the copy is the one
+    that goes wrong.
+
+  * **`never_alarm` is read from the PAYLOAD.** Whether a code may page a human
+    travels on the wire with that code. This package holds no list of its own,
+    because two lists drift and the one that drifts is the one that pages a
+    technician because a car arrived.
+
+  * **A notification is a TRANSITION, not a state.** It names what changed, and
+    it carries no plate, no image reference and no event detail -- the monitor
+    reads `/health`, not `/events`, so it never holds one.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from urllib.parse import urlsplit
+
+from .tickets import VOID_REASONS
+
+#: Bumped whenever a payload's shape changes in a way a consumer could notice.
+#: Additive changes do not bump it and a consumer ignores fields it does not
+#: know -- the same rule the lane and Vehicle ID contracts state, so one
+#: consumer can hold one policy for all three.
+#:
+#: **2, since the agent gained a vend route.** Every change then is additive by that rule --
+#: new fields, new event kinds, new codes -- and it is bumped anyway, for one
+#: reason that is not additive: `can_vend` CHANGED MEANING. It was `bool(ACTS)`
+#: and answered "can anything in this package act", which was `false`
+#: everywhere; it is now per lane and answers "does this agent hold what acting
+#: at THIS lane needs". A consumer reading the old field's meaning off the new
+#: payload would read a `true` as something this contract never said.
+CONTRACT_VERSION = 2
+
+#: Lane contract versions ANY process in this package can read, and there is
+#: exactly ONE of these.
+#:
+#: **It used to be three.** `agent.py`, `monitor.py` and `capture.py` each held
+#: their own tuple, and on 2026-08-31 the lane's contract went to 2 while all
+#: three still said `(1,)` -- so the monitor and the whole capture process
+#: refused to start against the lane on `lane-controller` main, and the agent
+#: read every lane as `lane_unavailable`. Three copies of one number is three
+#: places to forget, and the forgetting is silent in the reassuring direction:
+#: every consumer simply says the lane cannot be read.
+#:
+#: A lane on a version outside this set is REFUSED rather than partially read --
+#: the lane contract's own instruction to a consumer, and half-understanding a
+#: payload about a vehicle is worse than admitting it cannot be read.
+KNOWN_LANE_VERSIONS: tuple[int, ...] = (2,)
+
+
+class TargetKind(StrEnum):
+    """What kind of thing a target is, and therefore how it is read.
+
+    CLOSED. Each member names a contract this monitor knows how to read, and a
+    monitor that could be pointed at something it has no reader for would be
+    reporting on a thing it cannot interpret.
+    """
+
+    #: A service implementing `lane-controller/docs/CONTRACT.md`. Ours or a
+    #: third party's -- the monitor has no branch on which.
+    LANE = "lane"
+    #: A Vehicle ID service, read through its unauthenticated `GET /v1/health`.
+    IDENTITY_SERVICE = "identity_service"
+    #: An Open Parking AI platform, read through its operator surface.
+    PLATFORM = "platform"
+    #: A capture process implementing the capture half of THIS contract. It is
+    #: the same shape as a lane's health surface on purpose -- one reader, one
+    #: passthrough rule -- and it is how `camera_unreachable` gets from a camera
+    #: nobody can reach to a human who can go and look at it.
+    CAPTURE = "capture"
+    #: A gate agent -- this package's own third process, or anything
+    #: implementing the agent half of this contract. Its health entries are in
+    #: the lane's shape too, for the same reason: one reader. It is the target
+    #: that answers the intercom, so a monitor that cannot reach it is a site
+    #: whose drivers are pressing a button nobody hears.
+    AGENT = "agent"
+
+
+class SinkKind(StrEnum):
+    """How a human is told. CLOSED this version, and stated as closed.
+
+    SMS is a later round's provider and is deliberately not here. The set being
+    closed and published is what makes adding one an additive change with a
+    version bump behind it, rather than a surprise in somebody's configuration.
+    """
+
+    #: Structured JSON to stdout. Always on, and the one sink that needs no
+    #: provider, no credential and no network.
+    LOG = "log"
+    EMAIL = "email"
+    WEBHOOK = "webhook"
+
+
+class MonitorCode(StrEnum):
+    """The malfunctions the MONITOR ITSELF measures.
+
+    Every one of them is about the monitor's own view of the world -- something
+    it could not reach, something it could not tell anyone about, something a
+    target said about itself that this build cannot read. A target's own codes
+    are not in here: they are that target's vocabulary and they are published
+    unchanged, under `targets`.
+
+    The set is CLOSED and every member ships on every response, for the reason
+    the lane's is: a code that is absent reads to a consumer exactly like a code
+    that is fine.
+    """
+
+    #: The lane target did not answer. This is "no connection" for a lane, and
+    #: it is measured by the monitor because nothing else can measure it.
+    LANE_UNREACHABLE = "lane_unreachable"
+    IDENTITY_SERVICE_UNREACHABLE = "identity_service_unreachable"
+    PLATFORM_UNREACHABLE = "platform_unreachable"
+    CAPTURE_UNREACHABLE = "capture_unreachable"
+    AGENT_UNREACHABLE = "agent_unreachable"
+    #: The target ANSWERED, and what it answered was no -- a 3xx or a 4xx. It
+    #: is not down: it is up, it received the request, and it declined it, and
+    #: the `status` on the entry says which decline. A dead credential (401), a
+    #: platform older than this build (404) and a target steering this monitor
+    #: at another host (3xx) are three different repairs on three different
+    #: machines, and every one of them used to be published as "that target is
+    #: unreachable" -- which names the wrong machine and carries no status for a
+    #: human to tell them apart with.
+    LANE_REFUSED_US = "lane_refused_us"
+    IDENTITY_SERVICE_REFUSED_US = "identity_service_refused_us"
+    PLATFORM_REFUSED_US = "platform_refused_us"
+    CAPTURE_REFUSED_US = "capture_refused_us"
+    AGENT_REFUSED_US = "agent_refused_us"
+    #: A target answered with a contract version this build does not know. Its
+    #: codes STOP being passed through while this holds: half-understanding a
+    #: payload is worse than admitting you cannot read it.
+    TARGET_CONTRACT_UNSUPPORTED = "target_contract_unsupported"
+    #: A sink could not deliver. Reported on this surface AND to every other
+    #: sink that works -- never wrong silently applies to the messenger too.
+    SINK_DELIVERY_FAILED = "sink_delivery_failed"
+    #: The durable record of what this monitor sent could not be written. The
+    #: MESSAGE STILL WENT OUT -- a record store that could stop a page is worse
+    #: than no record -- but the account a platform reads of it is now missing
+    #: from this box, and that is said rather than discovered at the exception.
+    RECORD_STORE_UNWRITABLE = "record_store_unwritable"
+    #: A lane device the PLATFORM has not heard from for longer than this site
+    #: allows. Derived from `lane_devices.last_seen_at`, which only the platform
+    #: can see: a lane that has gone quiet is quiet, so the fault is invisible
+    #: from the lane's own end.
+    LANE_GONE_QUIET = "lane_gone_quiet"
+
+
+class HealthState(StrEnum):
+    """Copied from the lane contract, in its words, because it is its rule.
+
+    A consumer holding one policy for both surfaces would otherwise have to hold
+    two definitions of `unknown`, and the day they diverge is the day one of
+    them starts meaning `ok`.
+    """
+
+    #: Somebody measured, and found nothing wrong.
+    OK = "ok"
+    #: The malfunction is happening.
+    ACTIVE = "active"
+    #: Nobody measured. NEVER read as `ok`.
+    UNKNOWN = "unknown"
+
+
+class Source(StrEnum):
+    """Where a code's answer comes from, published beside every answer."""
+
+    MEASURED = "measured"
+    NOT_MEASURED = "not_measured"
+    NO_SOURCE = "no_source"
+
+
+class Transition(StrEnum):
+    """What a notification is ABOUT. States are not sent; changes are.
+
+    A monitor that sent the current state would send the same message every poll
+    for as long as a fault lasted, and a human who has been told a thousand
+    times has been told nothing.
+    """
+
+    #: `ok` or `unknown` became `active`.
+    RAISED = "raised"
+    #: `active` became `ok`.
+    RECOVERED = "recovered"
+    #: `ok` or `active` became `unknown`. Sent ONCE. It is not a recovery and it
+    #: is not a fault: it is the loss of a measurement, which is its own event
+    #: and the one a monitor most easily hides.
+    NO_LONGER_MEASURED = "no_longer_measured"
+    #: The state has not changed and this site set a re-notify interval. Only an
+    #: `active` state repeats; a held `ok` is not news and a repeated recovery
+    #: is not a fact about anything.
+    STILL_ACTIVE = "still_active"
+
+
+#: WHERE each of the monitor's own codes gets its answer in this build. One
+#: copy, and the payload is built from it, so a code cannot ship with a source
+#: that disagrees with what the monitor actually does.
+#:
+#: Every one of them is `measured`: the monitor derives all of its own codes,
+#: and a code it could not derive would not be one of its own. `not_measured`
+#: and `no_source` exist in this enum because the states a TARGET publishes are
+#: passed through carrying them.
+MONITOR_SOURCES: dict[MonitorCode, Source] = {
+    MonitorCode.LANE_UNREACHABLE: Source.MEASURED,
+    MonitorCode.IDENTITY_SERVICE_UNREACHABLE: Source.MEASURED,
+    MonitorCode.PLATFORM_UNREACHABLE: Source.MEASURED,
+    MonitorCode.CAPTURE_UNREACHABLE: Source.MEASURED,
+    MonitorCode.LANE_REFUSED_US: Source.MEASURED,
+    MonitorCode.IDENTITY_SERVICE_REFUSED_US: Source.MEASURED,
+    MonitorCode.PLATFORM_REFUSED_US: Source.MEASURED,
+    MonitorCode.CAPTURE_REFUSED_US: Source.MEASURED,
+    MonitorCode.AGENT_UNREACHABLE: Source.MEASURED,
+    MonitorCode.AGENT_REFUSED_US: Source.MEASURED,
+    MonitorCode.TARGET_CONTRACT_UNSUPPORTED: Source.MEASURED,
+    MonitorCode.SINK_DELIVERY_FAILED: Source.MEASURED,
+    MonitorCode.RECORD_STORE_UNWRITABLE: Source.MEASURED,
+    MonitorCode.LANE_GONE_QUIET: Source.MEASURED,
+}
+
+#: The unreachable code for each kind of target. Derived from nothing else, and
+#: it is the one place the pairing is written: a target kind added without one
+#: fails here rather than silently reporting nothing when it goes dark.
+UNREACHABLE_CODE: dict[TargetKind, MonitorCode] = {
+    TargetKind.LANE: MonitorCode.LANE_UNREACHABLE,
+    TargetKind.IDENTITY_SERVICE: MonitorCode.IDENTITY_SERVICE_UNREACHABLE,
+    TargetKind.PLATFORM: MonitorCode.PLATFORM_UNREACHABLE,
+    TargetKind.CAPTURE: MonitorCode.CAPTURE_UNREACHABLE,
+    TargetKind.AGENT: MonitorCode.AGENT_UNREACHABLE,
+}
+
+#: The same pairing for the OTHER half of a failed poll: the target answered,
+#: and said no. Written beside the map above so a target kind cannot gain one
+#: without the other -- a kind with an `unreachable` code and no `refused_us`
+#: code would publish every refusal from it as silence again.
+REFUSED_CODE: dict[TargetKind, MonitorCode] = {
+    TargetKind.LANE: MonitorCode.LANE_REFUSED_US,
+    TargetKind.IDENTITY_SERVICE: MonitorCode.IDENTITY_SERVICE_REFUSED_US,
+    TargetKind.PLATFORM: MonitorCode.PLATFORM_REFUSED_US,
+    TargetKind.CAPTURE: MonitorCode.CAPTURE_REFUSED_US,
+    TargetKind.AGENT: MonitorCode.AGENT_REFUSED_US,
+}
+
+
+def published_url(url: str) -> str:
+    """A target's URL as this monitor publishes it: scheme, host, port, path.
+
+    NOTHING ELSE. `GET /v1/monitor` exists so a consumer can see WHAT is being
+    watched, and those four are what answers that. Userinfo is refused at
+    startup, and this is the second half of the same rule: what is published is
+    REBUILT from the parts that are an address, so a credential -- or a query
+    string, or a fragment -- cannot ride out on this route because somebody
+    found a way past the first check.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    port = f":{parts.port}" if parts.port is not None else ""
+    return f"{parts.scheme}://{host}{port}{parts.path}"
+
+
+def _text(value, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _iso_utc(value, field_name: str) -> str:
+    """An ISO 8601 timestamp that carries an offset.
+
+    A naive timestamp is refused rather than assumed to be UTC -- the same rule
+    the lane and Vehicle ID contracts apply, and for the same reason: assuming is
+    how two machines in two timezones come to disagree about when something
+    broke, months later, with the repair already made.
+    """
+    text = _text(value, field_name)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} is not ISO 8601: {text!r}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} has no UTC offset: {text!r}")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/monitor
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class TargetDescription:
+    """One declared target, as a consumer may see it.
+
+    `url` is here because knowing WHAT is being watched is the whole value of
+    this route, and a URL is not a credential. `authenticated` says whether one
+    is configured; the credential itself is not on this surface, is not on any
+    surface, and is not in this process's argument vector either -- it is read
+    from a file.
+    """
+
+    name: str
+    kind: str
+    url: str
+    #: How often this target is polled. A per-site SETTING and an ASSUMPTION:
+    #: nothing here measures how often a lane's health changes. It is published
+    #: rather than documented because it is a property of THIS monitor's
+    #: configuration, and a document could only describe one.
+    poll_seconds: float
+    #: Whether a credential is configured for this target. Not the credential.
+    authenticated: bool
+    #: How long this monitor waits for this target's answer. A per-site SETTING
+    #: and an ASSUMPTION, published for the same reason `poll_seconds` is: it is
+    #: a property of THIS monitor's configuration, and a document could only
+    #: describe one. What it is drawn against is in `client.DEFAULT_TIMEOUT`.
+    timeout_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        _text(self.name, "target.name")
+        if self.kind not in tuple(kind.value for kind in TargetKind):
+            raise ValueError(f"target kind must be one of {tuple(TargetKind)}, got {self.kind!r}")
+        _text(self.url, "target.url")
+        parsed = urlsplit(self.url)
+        if parsed.username or parsed.password:
+            # The same refusal the configuration makes, held one layer lower so
+            # it cannot be routed around by building the payload some other way.
+            # This route publishes what a site watches; it may not publish how
+            # to authenticate to it.
+            raise ValueError(
+                "target.url has userinfo in URL: credentials come from files, and this route "
+                "publishes an address rather than a way in"
+            )
+        if not isinstance(self.poll_seconds, float) or self.poll_seconds <= 0:
+            raise ValueError(
+                f"poll_seconds must be a positive number of seconds, got {self.poll_seconds!r}"
+            )
+        if not isinstance(self.authenticated, bool):
+            raise ValueError("target.authenticated must be a bool")
+        if not isinstance(self.timeout_seconds, float) or self.timeout_seconds <= 0:
+            raise ValueError(
+                f"timeout_seconds must be a positive number of seconds, "
+                f"got {self.timeout_seconds!r}"
+            )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SinkDescription:
+    """One declared sink: what it is, and nothing about how to reach it.
+
+    No host, no recipient, no URL and no credential. A consumer of this route is
+    entitled to know that somebody is being told; where they are is that site's
+    business and putting it here would publish an address list on a read route.
+    """
+
+    name: str
+    kind: str
+
+    def __post_init__(self) -> None:
+        _text(self.name, "sink.name")
+        if self.kind not in tuple(kind.value for kind in SinkKind):
+            raise ValueError(f"sink kind must be one of {tuple(SinkKind)}, got {self.kind!r}")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorDescription:
+    """`GET /v1/monitor` -- who this monitor is, and what it watches."""
+
+    monitor_id: str
+    site_id: str
+    targets: tuple[TargetDescription, ...]
+    sinks: tuple[SinkDescription, ...]
+    #: How many notifications `GET /v1/monitor/events` can still serve behind
+    #: the current cursor. A per-site SETTING with a published default, and it
+    #: is PUBLISHED rather than described because a consumer's own catch-up
+    #: policy depends on it: fall further behind than this and you are told
+    #: `reset` rather than served a short page. The lane contract publishes its
+    #: own on `GET /v1/lane` for the same reason and in the same field name.
+    event_window_depth: int = 0
+    #: `[notify] retry_attempts` and `retry_seconds`: how many more times a
+    #: delivery that failed is tried, and how far apart. Published because a
+    #: consumer of the message records reads `retrying` against them.
+    retry_attempts: int | None = None
+    retry_seconds: float | None = None
+    #: `[records] retention_days` and `max_bytes`: how long the record of what
+    #: this monitor sent is kept, and the most of it this box keeps. The
+    #: directory is NOT published: it is a path on a box, and a consumer reads
+    #: the records through `GET /v1/monitor/messages`, never off the disk.
+    record_retention_days: int | None = None
+    record_max_bytes: int | None = None
+    contract_version: int = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        _text(self.monitor_id, "monitor_id")
+        _text(self.site_id, "site_id")
+        if isinstance(self.event_window_depth, bool) or not isinstance(
+            self.event_window_depth, int
+        ) or self.event_window_depth <= 0:
+            raise ValueError(
+                "event_window_depth must be a positive number of notifications, got "
+                f"{self.event_window_depth!r}"
+            )
+        if not self.targets:
+            # The same refusal the configuration makes, held one layer lower so
+            # it cannot be routed around by building the payload some other way.
+            # A monitor watching nothing that answers this route at all is the
+            # lie this module exists to prevent.
+            raise ValueError(
+                "a monitor with no targets watches nothing and may not describe itself"
+            )
+        if not self.sinks:
+            raise ValueError("a monitor with no sinks can tell nobody anything")
+
+    def to_dict(self) -> dict:
+        return {
+            "monitor_id": self.monitor_id,
+            "site_id": self.site_id,
+            "contract_version": self.contract_version,
+            "event_window_depth": self.event_window_depth,
+            "retry_attempts": self.retry_attempts,
+            "retry_seconds": self.retry_seconds,
+            "record_retention_days": self.record_retention_days,
+            "record_max_bytes": self.record_max_bytes,
+            "targets": [target.to_dict() for target in self.targets],
+            "sinks": [sink.to_dict() for sink in self.sinks],
+        }
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/monitor/health
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorEntry:
+    """One of the MONITOR'S OWN codes, its subject, its state and its source.
+
+    `subject` is what the code is about: which target could not be reached,
+    which sink could not deliver, which device has gone quiet. It is part of the
+    identity of the entry, because "a sink failed" and "which sink failed" are
+    different facts and only one of them can be acted on.
+    """
+
+    code: str
+    subject: str
+    state: str
+    #: The HTTP status the target answered with, when the code is about an
+    #: ANSWER. `null` everywhere else. It is on the entry rather than only in
+    #: the message because a human arriving at this route after the message has
+    #: scrolled away needs the same fact: 401 is a credential, 404 is an older
+    #: target, and neither is a target that is down.
+    status: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.code not in tuple(code.value for code in MonitorCode):
+            raise ValueError(f"{self.code!r} is not a monitor code in this contract")
+        _text(self.subject, "subject")
+        if self.state not in tuple(state.value for state in HealthState):
+            raise ValueError(f"state must be one of {tuple(HealthState)}, got {self.state!r}")
+        if self.status is not None and (
+            isinstance(self.status, bool) or not isinstance(self.status, int)
+            or not 100 <= self.status <= 599
+        ):
+            raise ValueError(f"status must be an HTTP status code or null, got {self.status!r}")
+        if self.status is not None and self.code not in tuple(
+            code.value for code in REFUSED_CODE.values()
+        ):
+            # A status on any other code would be a number with no answer behind
+            # it. The codes that carry one are the ones that exist because a
+            # target answered.
+            raise ValueError(f"{self.code} does not carry an HTTP status; got {self.status!r}")
+        # The invariant, copied from the lane contract because it is the same
+        # invariant. `ok` and `active` are claims about a measurement, and a
+        # code this build does not derive has no standing to make either.
+        if self.state != HealthState.UNKNOWN and self.source != Source.MEASURED:
+            raise ValueError(
+                f"{self.code} is {self.source.value} but claims state {self.state!r}. "
+                "Only a code this build derives may answer anything but 'unknown'."
+            )
+
+    @property
+    def source(self) -> Source:
+        return MONITOR_SOURCES[MonitorCode(self.code)]
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "subject": self.subject,
+            "state": self.state,
+            "source": self.source.value,
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TargetHealth:
+    """What one target said about itself, last time it was asked.
+
+    `codes` is that target's payload, PASSED THROUGH. Not re-keyed, not
+    re-ordered, not re-labelled and not filtered: whatever entries it published,
+    exactly as it published them. A monitor that rendered a lane's health in its
+    own vocabulary would be a second copy of that lane's claim about itself, and
+    the copy is the one that comes to disagree.
+
+    `polled_at` is `null` until this target has answered once, and `codes` is
+    empty then -- which is a different fact from a target that answered with
+    nothing to say, and the monitor's own `*_unreachable` code is what separates
+    them.
+
+    `contract_version` is the version the TARGET declared, so a consumer can see
+    what it was read as. `null` for a target whose contract publishes no version
+    -- the platform's operator surface does not, and that is a gap named here
+    rather than papered over with a number this monitor invented.
+    """
+
+    name: str
+    kind: str
+    polled_at: str | None
+    contract_version: int | None
+    codes: tuple[dict, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        _text(self.name, "target.name")
+        if self.kind not in tuple(kind.value for kind in TargetKind):
+            raise ValueError(f"target kind must be one of {tuple(TargetKind)}, got {self.kind!r}")
+        if self.polled_at is not None:
+            _iso_utc(self.polled_at, "polled_at")
+        if self.contract_version is not None and not isinstance(self.contract_version, int):
+            raise ValueError(
+                f"contract_version must be an int or null, got {self.contract_version!r}"
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "kind": self.kind,
+            "polled_at": self.polled_at,
+            "contract_version": self.contract_version,
+            "codes": list(self.codes),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorHealth:
+    """`GET /v1/monitor/health` -- the monitor's own codes, and every target's.
+
+    Refused at construction if one of the monitor's own codes is missing or
+    duplicated for a subject. An absent code is indistinguishable from a healthy
+    one to whoever reads this, which is the whole reason the set is closed.
+    """
+
+    codes: tuple[MonitorEntry, ...] = field(default_factory=tuple)
+    targets: tuple[TargetHealth, ...] = field(default_factory=tuple)
+    #: The message-record store, as READS: how much it holds, how old, and --
+    #: the reason it is on this route -- how many records its bounds have
+    #: removed and up to when, so a gap in the account is counted rather than
+    #: found. See `records.RecordStore.reads`.
+    records: dict | None = None
+
+    def __post_init__(self) -> None:
+        seen = [(entry.code, entry.subject) for entry in self.codes]
+        if len(seen) != len(set(seen)):
+            raise ValueError("a monitor code appears twice for one subject in one payload")
+        missing = {code.value for code in MonitorCode} - {code for code, _ in seen}
+        if missing:
+            raise ValueError(
+                f"health payload is missing {sorted(missing)}. Every code ships every time: "
+                "one that is absent reads exactly like one that is fine. A code with no "
+                "subject yet ships once, `unknown`, under the monitor's own id."
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "codes": [entry.to_dict() for entry in self.codes],
+            "targets": [target.to_dict() for target in self.targets],
+            "records": self.records,
+        }
+
+
+# ---------------------------------------------------------------------------
+# The notification -- what a sink sends, and what GET /v1/monitor/events serves
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Notification:
+    """One transition, told to a human, and recorded on the events route.
+
+    THIS IS THE WHOLE MESSAGE. There is no second, richer rendering held back
+    for one of the sinks: what a webhook receives and what an email says are
+    built from this object, so a plate that is not on it cannot be on either.
+
+    What it deliberately does NOT carry: a plate, an image reference, an event
+    id, or any of a target's event detail. The monitor reads `/health`, never
+    `/events` or `/state`, so it does not hold one to leak -- and this dataclass
+    has nowhere to put one.
+    """
+
+    site_id: str
+    #: The lane this is about, when the target that is about it IS a lane.
+    #: `null` for the platform's codes, the identity service's, and this
+    #: monitor's own -- stamping a lane's id on those reads as "that lane cannot
+    #: reach the platform", which is a different machine, a different fault and
+    #: a different repair from the true one.
+    lane_id: str | None
+    target: str
+    code: str
+    #: Which sink, which device, which target. `null` when the code is about the
+    #: target as a whole.
+    subject: str | None
+    transition: str
+    #: The source the TARGET gave for this code, passed through. `measured` for
+    #: the monitor's own codes.
+    source: str
+    #: The target's own caveat for this code, when it published one. Carried
+    #: because a caveat that stays behind at the monitor is a caveat the human
+    #: reading the message does not get.
+    caveat: str | None
+    at: str
+    #: The HTTP status a target answered with, for the codes that exist because
+    #: it answered. `null` everywhere else. It is in the MESSAGE, not only on the
+    #: health route, because the message is what wakes somebody: without it,
+    #: "the platform is refusing us" sends them to the platform when the fault
+    #: is a token in a file beside this process.
+    status: int | None = None
+    #: The id of the durable record of THIS message on `GET /v1/monitor/messages`
+    #: -- the same on every attempt, so a receiver that is handed a retry of
+    #: something it already has can tell, and drop it. `null` only on a
+    #: notification built outside the monitor.
+    record_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.site_id, "site_id")
+        _text(self.target, "target")
+        _text(self.code, "code")
+        if self.transition not in tuple(t.value for t in Transition):
+            raise ValueError(
+                f"transition must be one of {tuple(Transition)}, got {self.transition!r}"
+            )
+        _text(self.source, "source")
+        _iso_utc(self.at, "at")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class EventPage:
+    """`GET /v1/monitor/events?since=N` -- the notifications this monitor sent.
+
+    Deliberately the same shape and the same semantics as the lane contract's
+    `GET /v1/lane/events` and the Vehicle ID service's `GET /v1/reads`, field for
+    field, so one consumer can hold one cursor policy for all three surfaces.
+
+      * the cursor is monotonic within one run and is NOT durable across a
+        restart -- it is a catch-up window for a consumer that blinked, not a
+        record of anything. The durable record of what a monitor said is
+        whatever its sinks delivered it to;
+      * `since` ahead of this monitor's own cursor sets `reset`. An empty list
+        without that flag is indistinguishable from "nothing happened", which is
+        how a consumer silently misses everything after a restart;
+      * `since` behind the oldest notification still held also sets `reset`. The
+        window is bounded and a consumer that has fallen further behind than
+        that would otherwise receive a page with the evicted notifications
+        simply absent from it, which looks exactly like a complete one.
+
+    `dropped` is how many notifications the window has evicted. Published
+    because a gap nobody knows about is worse than one that is counted -- and on
+    this surface a gap is a fault nobody was told about.
+    """
+
+    cursor: int
+    reset: bool
+    dropped: int
+    events: tuple[dict, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "cursor": self.cursor,
+            "reset": self.reset,
+            "dropped": self.dropped,
+            "events": list(self.events),
+        }
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/monitor/messages -- the DURABLE record of every message it sent
+# ---------------------------------------------------------------------------
+
+
+class MessageKind(StrEnum):
+    """What a message record is a record OF. The webhook's own `kind`, reused.
+
+    The webhook already tells its receiver which of two things arrived, in this
+    word; the record says the same thing in the same word, so there is one
+    vocabulary for it and not two.
+    """
+
+    #: A transition: a code was raised, held, recovered, or stopped being
+    #: measured.
+    TRANSITION = "transition"
+    #: The one message at startup saying what nobody is measuring.
+    UNMEASURED = "unmeasured"
+
+
+#: Whose measurement a message is about. `monitor` is this monitor's own --
+#: `lane_unreachable`, `sink_delivery_failed`; `target` is a code a target
+#: published and this monitor passed through. They are published because two
+#: codes are spelt the same on both sides and mean different machines, and the
+#: record is read months later by somebody who was not there.
+RECORD_ORIGINS: tuple[str, ...] = ("monitor", "target")
+
+#: What a message record can say it is ABOUT: a declared target's kind, or this
+#: monitor itself -- a sink that cannot deliver, the record store, the startup
+#: message.
+RECORD_TARGET_KINDS: tuple[str, ...] = tuple(kind.value for kind in TargetKind) + ("monitor",)
+
+
+class DeliveryState(StrEnum):
+    """Where one sink's delivery of one message has got to."""
+
+    #: The record is written and the sink has not been tried yet. A record that
+    #: says this after a restart is one the last run did not finish, and it is
+    #: closed as `interrupted` at the next start rather than left to look live.
+    PENDING = "pending"
+    #: The sink accepted it -- SMTP's reply, the webhook's 2xx, the line written.
+    DELIVERED = "delivered"
+    #: It failed, and another attempt is due at `next_attempt_at`.
+    RETRYING = "retrying"
+    #: It failed, and no attempt is left.
+    FAILED = "failed"
+    #: The process stopped before this delivery finished. Nothing here can say
+    #: whether the last attempt reached anybody, so it says that.
+    INTERRUPTED = "interrupted"
+    #: It was due to be tried again, and was NOT, because by then it would have
+    #: said an old fact after a new one: a later message about the same code
+    #: had already reached this sink (`superseded_by` names it), or the code is
+    #: no longer in the state this message announced (`superseded_by` is null).
+    #: A `raised` retried after its `recovered` reopens an incident on a pager.
+    SUPERSEDED = "superseded"
+
+
+class DeliveryResult(StrEnum):
+    """What ONE attempt came to."""
+
+    ACCEPTED = "accepted"
+    FAILED = "failed"
+
+
+#: What a delivery can say about whether a PERSON acknowledged it. One value
+#: this version, and it is said rather than left out: no sink in this package
+#: carries an acknowledgement back -- SMTP has none, a webhook's 2xx is its
+#: receiver taking the request and not a person reading it, and a log line is
+#: read by whoever reads it. So every delivery is `not_acknowledged`, which
+#: means NOTHING TOLD US, not that nobody read it. A sink that can carry one
+#: adds `acknowledged` here, additively.
+ACKNOWLEDGEMENTS: tuple[str, ...] = ("not_acknowledged",)
+
+
+def _optional_iso(value, field_name: str) -> None:
+    if value is not None:
+        _iso_utc(value, field_name)
+
+
+def _optional_status(value, field_name: str, low: int, high: int) -> None:
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high
+    ):
+        raise ValueError(f"{field_name} must be a status code or null, got {value!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryAttempt:
+    """One try at one sink, with the evidence that sink gives and nothing more.
+
+    `reply_code` and `reply` are the SMTP server's answer to the message -- the
+    one the library raises on unless it is 250 -- and `http_status` is the
+    webhook receiver's. Each is `null` where the sink does not give it: the log
+    sink has no answer but "written", and a failure that never reached a server
+    has no status. `reason` is a plain sentence, on a failure only, and it never
+    carries an email address: the server's own words are reduced before they
+    are kept, because this text is logged as well as recorded.
+    """
+
+    at: str
+    result: str
+    reply_code: int | None = None
+    reply: str | None = None
+    http_status: int | None = None
+    reason: str | None = None
+    #: The recipients an SMTP server REFUSED while accepting the message for
+    #: the rest. A partial acceptance is still a message somebody did not get.
+    refused_recipients: tuple[str, ...] = ()
+    #: On a failure: whether it was one worth trying again -- the network, a
+    #: timeout, SMTP 4xx, HTTP 5xx or 429 -- or a refusal that would only be
+    #: refused again: SMTP 5xx, any other HTTP 4xx, a redirect. `null` on an
+    #: accepted attempt.
+    transient: bool | None = None
+
+    def __post_init__(self) -> None:
+        _iso_utc(self.at, "attempt.at")
+        if self.result not in tuple(one.value for one in DeliveryResult):
+            raise ValueError(f"result must be one of {tuple(DeliveryResult)}, got {self.result!r}")
+        _optional_status(self.reply_code, "reply_code", 200, 599)
+        _optional_status(self.http_status, "http_status", 100, 599)
+        if self.result == DeliveryResult.FAILED and not self.reason:
+            raise ValueError("a failed attempt carries a reason; a failure with none is a guess")
+
+    def to_dict(self) -> dict:
+        return {
+            "at": self.at,
+            "result": self.result,
+            "reply_code": self.reply_code,
+            "reply": self.reply,
+            "http_status": self.http_status,
+            "reason": self.reason,
+            "refused_recipients": list(self.refused_recipients),
+            "transient": self.transient,
+        }
+
+    @classmethod
+    def from_dict(cls, body: dict) -> DeliveryAttempt:
+        return cls(
+            at=body["at"],
+            result=body["result"],
+            reply_code=body.get("reply_code"),
+            reply=body.get("reply"),
+            http_status=body.get("http_status"),
+            reason=body.get("reason"),
+            refused_recipients=tuple(body.get("refused_recipients") or ()),
+            transient=body.get("transient"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Delivery:
+    """One sink's part in one message: who it was for, and what became of it.
+
+    `recipients` is the recipient AS CONFIGURED: the addresses an email sink
+    sends to, the host a webhook posts to -- never its path or query, which can
+    carry a token -- and nothing for the log sink, which has nobody behind it.
+    `recipient_configured` is false exactly then, and a message whose every
+    delivery says so is one nobody was paged with.
+
+    **This record is the only place an email address appears.** It is on this
+    route because "who received" is the question it answers; it is never in a
+    log line, never in a sink's failure reason, and never on `GET /v1/monitor`.
+    """
+
+    sink: str
+    kind: str
+    recipients: tuple[str, ...]
+    recipient_configured: bool
+    state: str
+    sent_at: str | None = None
+    delivered_at: str | None = None
+    next_attempt_at: str | None = None
+    attempts: tuple[DeliveryAttempt, ...] = ()
+    acknowledgement: str = ACKNOWLEDGEMENTS[0]
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+    #: On a `superseded` delivery: the record of the later message about the
+    #: same code that had already reached this sink, or `null` where what
+    #: superseded it was the code's own state.
+    superseded_by: str | None = None
+
+    def __post_init__(self) -> None:
+        _text(self.sink, "delivery.sink")
+        if self.kind not in tuple(kind.value for kind in SinkKind):
+            # A test double or a future sink may carry another word; the record
+            # keeps what the sink said it is rather than renaming it.
+            _text(self.kind, "delivery.kind")
+        if self.state not in tuple(one.value for one in DeliveryState):
+            raise ValueError(f"state must be one of {tuple(DeliveryState)}, got {self.state!r}")
+        for name in ("sent_at", "delivered_at", "next_attempt_at", "acknowledged_at"):
+            _optional_iso(getattr(self, name), name)
+        if self.acknowledgement not in ACKNOWLEDGEMENTS:
+            raise ValueError(f"acknowledgement must be one of {ACKNOWLEDGEMENTS}")
+        if self.state == DeliveryState.DELIVERED and self.delivered_at is None:
+            raise ValueError("a delivered delivery says when")
+        if self.state == DeliveryState.RETRYING and self.next_attempt_at is None:
+            raise ValueError("a retrying delivery says when the next attempt is due")
+
+    def to_dict(self) -> dict:
+        return {
+            "sink": self.sink,
+            "kind": self.kind,
+            "recipients": list(self.recipients),
+            "recipient_configured": self.recipient_configured,
+            "state": self.state,
+            "sent_at": self.sent_at,
+            "delivered_at": self.delivered_at,
+            "next_attempt_at": self.next_attempt_at,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "acknowledgement": self.acknowledgement,
+            "acknowledged_at": self.acknowledged_at,
+            "acknowledged_by": self.acknowledged_by,
+            "superseded_by": self.superseded_by,
+        }
+
+    @classmethod
+    def from_dict(cls, body: dict) -> Delivery:
+        return cls(
+            sink=body["sink"],
+            kind=body["kind"],
+            recipients=tuple(body.get("recipients") or ()),
+            recipient_configured=bool(body.get("recipient_configured")),
+            state=body["state"],
+            sent_at=body.get("sent_at"),
+            delivered_at=body.get("delivered_at"),
+            next_attempt_at=body.get("next_attempt_at"),
+            attempts=tuple(DeliveryAttempt.from_dict(one) for one in body.get("attempts") or ()),
+            acknowledgement=body.get("acknowledgement", ACKNOWLEDGEMENTS[0]),
+            acknowledged_at=body.get("acknowledged_at"),
+            acknowledged_by=body.get("acknowledged_by"),
+            superseded_by=body.get("superseded_by"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MessageRecord:
+    """One message this monitor sent, kept, and served on the messages route.
+
+    Built from the same `Notification` every sink is handed, plus what only the
+    sending knows: WHO it was for, WHEN each sink took it or refused it, and how
+    the episode it belongs to started and ended. It carries no plate for the
+    reason the notification carries none -- the monitor reads `/health`, so it
+    has none to carry -- and the plate sweep runs over this record too.
+
+    `transition` is the notification's own word: `raised`, `still_active`,
+    `recovered` (cleared), `no_longer_measured`. `first_seen_at` is when THIS
+    RUN of the monitor first saw the episode `active`; `cleared_at` is set on
+    the `recovered` that ends it. A restart re-raises what is still active, as
+    the contract has always said, so the earlier raise and the new one are two
+    records and both are here.
+    """
+
+    record_id: str
+    kind: str
+    site_id: str
+    monitor_id: str
+    lane_id: str | None
+    target: str
+    target_kind: str
+    code: str | None
+    subject: str | None
+    origin: str
+    transition: str | None
+    at: str
+    first_seen_at: str | None
+    cleared_at: str | None
+    source: str | None
+    caveat: str | None
+    status: int | None
+    deliveries: tuple[Delivery, ...]
+    #: Set by the store on every write. `0` until the first one.
+    revision: int = 0
+
+    def __post_init__(self) -> None:
+        _text(self.record_id, "record_id")
+        if self.kind not in tuple(one.value for one in MessageKind):
+            raise ValueError(f"kind must be one of {tuple(MessageKind)}, got {self.kind!r}")
+        _text(self.site_id, "site_id")
+        _text(self.monitor_id, "monitor_id")
+        _text(self.target, "target")
+        if self.target_kind not in RECORD_TARGET_KINDS:
+            raise ValueError(f"target_kind must be one of {RECORD_TARGET_KINDS}")
+        if self.origin not in RECORD_ORIGINS:
+            raise ValueError(f"origin must be one of {RECORD_ORIGINS}")
+        if self.kind == MessageKind.TRANSITION:
+            _text(self.code, "code")
+            if self.transition not in tuple(one.value for one in Transition):
+                raise ValueError(f"transition must be one of {tuple(Transition)}")
+        elif self.transition is not None:
+            raise ValueError("only a transition record carries a transition")
+        _iso_utc(self.at, "at")
+        _optional_iso(self.first_seen_at, "first_seen_at")
+        _optional_iso(self.cleared_at, "cleared_at")
+        if self.cleared_at is not None and self.transition != Transition.RECOVERED:
+            raise ValueError("cleared_at belongs on the `recovered` that ends an episode")
+        _optional_status(self.status, "status", 100, 599)
+        if not self.deliveries:
+            raise ValueError("a message with no delivery was sent to nobody, not to log")
+
+    @property
+    def paged(self) -> bool:
+        """Whether any sink had somebody behind it. DERIVED, so it cannot lie."""
+        return any(delivery.recipient_configured for delivery in self.deliveries)
+
+    @property
+    def unfinished(self) -> bool:
+        return any(
+            delivery.state in (DeliveryState.PENDING, DeliveryState.RETRYING)
+            for delivery in self.deliveries
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "record_id": self.record_id,
+            "revision": self.revision,
+            "kind": self.kind,
+            "site_id": self.site_id,
+            "monitor_id": self.monitor_id,
+            "lane_id": self.lane_id,
+            "target": self.target,
+            "target_kind": self.target_kind,
+            "code": self.code,
+            "subject": self.subject,
+            "origin": self.origin,
+            "transition": self.transition,
+            "at": self.at,
+            "first_seen_at": self.first_seen_at,
+            "cleared_at": self.cleared_at,
+            "source": self.source,
+            "caveat": self.caveat,
+            "status": self.status,
+            "paged": self.paged,
+            "deliveries": [delivery.to_dict() for delivery in self.deliveries],
+        }
+
+    @classmethod
+    def from_dict(cls, body: dict) -> MessageRecord:
+        return cls(
+            record_id=body["record_id"],
+            kind=body["kind"],
+            site_id=body["site_id"],
+            monitor_id=body["monitor_id"],
+            lane_id=body.get("lane_id"),
+            target=body["target"],
+            target_kind=body["target_kind"],
+            code=body.get("code"),
+            subject=body.get("subject"),
+            origin=body["origin"],
+            transition=body.get("transition"),
+            at=body["at"],
+            first_seen_at=body.get("first_seen_at"),
+            cleared_at=body.get("cleared_at"),
+            source=body.get("source"),
+            caveat=body.get("caveat"),
+            status=body.get("status"),
+            deliveries=tuple(Delivery.from_dict(one) for one in body.get("deliveries") or ()),
+            revision=int(body.get("revision") or 0),
+        )
+
+
+#: The state a code is IN after each transition. What a retry is checked
+#: against: a `raised` is worth sending again only while the code is still
+#: `active`, a `recovered` only while it is `ok`.
+TRANSITION_STATE: dict[str, str] = {
+    Transition.RAISED.value: HealthState.ACTIVE.value,
+    Transition.STILL_ACTIVE.value: HealthState.ACTIVE.value,
+    Transition.RECOVERED.value: HealthState.OK.value,
+    Transition.NO_LONGER_MEASURED.value: HealthState.UNKNOWN.value,
+}
+
+
+def message_record_key(body: dict) -> str | None:
+    """What a message is ABOUT, as one string: origin, target, code, subject.
+
+    Two messages with the same key are about the same thing, and the later one
+    supersedes a retry of the earlier. The startup message's key is the
+    monitor's, so a new run's startup message supersedes the last run's.
+    """
+    if body.get("kind") == MessageKind.UNMEASURED.value:
+        return f"unmeasured|{body.get('monitor_id')}"
+    return "|".join(
+        str(body.get(name) or "") for name in ("origin", "target", "code", "subject")
+    )
+
+
+def message_record_unfinished(body: dict) -> bool:
+    """Whether a STORED message record was left with a delivery in progress."""
+    return any(
+        isinstance(one, dict)
+        and one.get("state") in (DeliveryState.PENDING.value, DeliveryState.RETRYING.value)
+        for one in body.get("deliveries") or ()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RecordsPage:
+    """`GET /v1/monitor/messages` and `GET /v1/agent/calls` -- one page of records.
+
+    NOT the event routes' shape, on purpose, because it is not their semantics.
+    Those are a catch-up window, in memory, gone at a restart. This is a store
+    on a disk, and its cursor is a REVISION from a counter persisted beside it:
+    it means the same thing after a restart, and a record that CHANGED -- a
+    retry, a call answered -- comes back under a newer revision with its change.
+
+      * `cursor` is what to send as `since` next. With `more`, it is the last
+        record's revision; without, it is the store's head.
+      * `reset`: `since` is ahead of this store's head. It is not the store that
+        cursor came from; start again from 0.
+      * `gap`: a record written after `since` was removed -- for age or for
+        space -- before it was served. This page is still good; the account is
+        not whole, and the health route counts what went.
+    """
+
+    items_key: str
+    records: tuple[dict, ...]
+    cursor: int
+    more: bool
+    reset: bool
+    gap: bool
+    query: dict
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "cursor": self.cursor,
+            "more": self.more,
+            "reset": self.reset,
+            "gap": self.gap,
+            "query": dict(self.query),
+            self.items_key: list(self.records),
+        }
+
+
+# ===========================================================================
+# THE CAPTURE PROCESS
+#
+# The second process in this package, and it is the first thing here that keeps
+# anything on a disk. The rule: when the barrier is broken the camera's job
+# changes from DECIDING to RECORDING -- capture every entry, timestamp and image
+# so the entries can be reconstructed. The camera captures an image every minute
+# and every time the gate opens, and the pictures of the cars are saved.
+#
+# **It has no opening authority either, and it holds no identity.** It reads a
+# camera and it reads a lane's read contract, both `GET`, and it writes to its
+# own directory. The store carries the JPEG the camera sent and eight fields
+# about WHEN and WHY it was taken. No plate, no plate region, no vehicle
+# attribute and no event detail -- the join to who the car was is the lane event
+# reference held here and the platform's durable record, one place each.
+# ===========================================================================
+
+
+class CaptureReason(StrEnum):
+    """Why a capture was taken. CLOSED, and published.
+
+    A consumer branches on all three: one of them is a clock and two of them are
+    a lane saying something happened, and the difference decides whether the
+    record has a lane event behind it to join to.
+    """
+
+    #: The clock. `[capture] interval_seconds` elapsed and nothing had happened.
+    INTERVAL = "interval"
+    #: A lane recorded that it grabbed frames for an arriving vehicle.
+    LANE_ARRIVAL = "lane_arrival"
+    #: A lane recorded that it vended. Every time the gate opens, in
+    #: the phrasing that is actually measurable: nothing anywhere knows whether
+    #: the boom moved, and the lane's own vend output has no feedback by design.
+    LANE_VEND = "lane_vend"
+
+
+class CaptureCode(StrEnum):
+    """The malfunctions the CAPTURE PROCESS measures. CLOSED, all `measured`.
+
+    Deliberately the same shape as the lane contract's malfunction table, so a
+    monitor reads this surface with the same code that reads a lane: one entry
+    per member on every response, each with a `state`, a `source`, a boolean
+    `never_alarm` and a `caveat`.
+
+    **None of them is `never_alarm`.** Every one is a physical thing that needs
+    somebody -- a camera that has stopped answering, a disk that will not take a
+    write, a store eating itself under a cap that is too small. `camera_feed_frozen`
+    is the one that comes closest to a false alarm, and what it measures is
+    stated in its caveat rather than being softened into silence.
+    """
+
+    #: Nothing came back from the camera. A network failure, a timeout, or a
+    #: 5xx: the camera's own process answered that it could not do the thing.
+    #: This is the rule that a disconnected camera is a malfunction.
+    CAMERA_UNREACHABLE = "camera_unreachable"
+    #: The camera ANSWERED, and the answer was no -- a 3xx or a 4xx, with its
+    #: status on the entry. 401 is the credential in the file beside this
+    #: process, 404 is a snapshot route this camera does not have, and 3xx is a
+    #: camera steering this process at another host. Three repairs, and folded
+    #: into "unreachable" a human cannot tell them apart.
+    CAMERA_REFUSED_US = "camera_refused_us"
+    #: Two consecutive snapshots from this camera were BYTE-IDENTICAL.
+    CAMERA_FEED_FROZEN = "camera_feed_frozen"
+    #: The store's directory would not take a write.
+    STORE_UNWRITABLE = "store_unwritable"
+    #: A write was refused because one purge could not get the store under
+    #: `[capture] max_bytes`. The store is not eating itself silently.
+    STORE_OVER_BUDGET = "store_over_budget"
+    #: An image with no sidecar, a sidecar with no image, or a sidecar the
+    #: contract will not accept, was found when the index was rebuilt. Reported
+    #: and then purged, never silently kept.
+    STORE_RECORD_INCOMPLETE = "store_record_incomplete"
+    #: The newest record this store holds is stamped AFTER the clock that reads
+    #: it. Measured on every purge. While it is active the age rule cannot reach
+    #: those records and the size cap is the only bound on them.
+    CLOCK_STEPPED_BACK = "clock_stepped_back"
+    #: The lane that triggers captures did not answer. `unknown` where no lane
+    #: is declared: standalone is a MODE, and nobody measured.
+    LANE_UNREACHABLE = "lane_unreachable"
+    #: The lane ANSWERED, and the answer was no, with its status on the entry.
+    LANE_REFUSED_US = "lane_refused_us"
+    #: The lane served a page this build cannot read: a timestamp with no UTC
+    #: offset, or a cursor that went backwards without `reset`. The page is
+    #: refused WHOLE -- the cursor is not adopted and nothing is photographed
+    #: under a lane reason. The same answer, for the same reason, as the
+    #: monitor's `target_contract_unsupported`.
+    LANE_CONTRACT_UNSUPPORTED = "lane_contract_unsupported"
+    #: The lane reported `reset`: it restarted, or it evicted further than this
+    #: process had fallen behind. Whatever was in that gap was never
+    #: photographed and cannot be. Recovers on the next page that is not a
+    #: reset; `lane_events_missed` counts what was lost, since start.
+    LANE_BACKLOG_LOST = "lane_backlog_lost"
+
+
+#: WHERE each capture code gets its answer in this build. One copy, and the
+#: payload is built from it. Every one is `measured` -- this process derives all
+#: of its own codes, and a code it could not derive would not be one of its own.
+CAPTURE_SOURCES: dict[CaptureCode, Source] = {
+    CaptureCode.CAMERA_UNREACHABLE: Source.MEASURED,
+    CaptureCode.CAMERA_REFUSED_US: Source.MEASURED,
+    CaptureCode.CAMERA_FEED_FROZEN: Source.MEASURED,
+    CaptureCode.STORE_UNWRITABLE: Source.MEASURED,
+    CaptureCode.STORE_OVER_BUDGET: Source.MEASURED,
+    CaptureCode.STORE_RECORD_INCOMPLETE: Source.MEASURED,
+    CaptureCode.CLOCK_STEPPED_BACK: Source.MEASURED,
+    CaptureCode.LANE_UNREACHABLE: Source.MEASURED,
+    CaptureCode.LANE_REFUSED_US: Source.MEASURED,
+    CaptureCode.LANE_CONTRACT_UNSUPPORTED: Source.MEASURED,
+    CaptureCode.LANE_BACKLOG_LOST: Source.MEASURED,
+}
+
+#: Whether a code may wake a human. Travels on the wire with the code, which is
+#: what a monitor reads -- this package does not hold a second list for its own
+#: consumption anywhere. Nothing here is `never_alarm`: every member is a
+#: physical thing that needs a person.
+CAPTURE_NEVER_ALARM: dict[CaptureCode, bool] = dict.fromkeys(CaptureCode, False)
+
+#: The caveat published beside a code, when there is something a human acting on
+#: it has to know. One copy, on the wire, so the caveat reaches the message
+#: rather than staying behind in a document nobody opens at 3am.
+CAPTURE_CAVEATS: dict[CaptureCode, str] = {
+    CaptureCode.CAMERA_FEED_FROZEN: (
+        "IDENTICAL means identical: this compares the bytes of two consecutive snapshots and "
+        "nothing else. A camera that burns a clock, a date or a frame counter into the image "
+        "is therefore NEVER frozen by this measure, however dead its sensor -- the overlay "
+        "changes the bytes. A camera with no overlay pointed at an empty lane at night can be "
+        "byte-identical while working perfectly. This measure is a cheap true negative, not a "
+        "test of whether a camera is seeing."
+    ),
+    CaptureCode.CLOCK_STEPPED_BACK: (
+        "WHILE THIS IS ACTIVE THE AGE RULE IS SUSPENDED for the records ahead of the clock: a "
+        "record stamped later than now is not older than any window, so the retention rule "
+        "cannot reach it and the size cap is the only bound on it. Nothing here corrects a "
+        "clock and nothing here measures how far out it is -- this says that the store holds a "
+        "record from the future, which is the fact a person has to act on."
+    ),
+}
+
+#: WHICH KIND OF THING each code is about, and therefore what its `subject` is.
+#: ONE copy: the process files its states under it and `CaptureHealth` refuses a
+#: payload that is not complete against it. A code whose subject kind lived in
+#: two places would be a code that is complete on one side and absent on the
+#: other, and an absent code reads to a consumer exactly like a code that is
+#: fine.
+CAMERA_CODES: tuple[CaptureCode, ...] = (
+    CaptureCode.CAMERA_UNREACHABLE,
+    CaptureCode.CAMERA_REFUSED_US,
+    CaptureCode.CAMERA_FEED_FROZEN,
+)
+
+#: The codes about the STORE. One subject: this process has one store.
+STORE_CODES: tuple[CaptureCode, ...] = (
+    CaptureCode.STORE_UNWRITABLE,
+    CaptureCode.STORE_OVER_BUDGET,
+    CaptureCode.STORE_RECORD_INCOMPLETE,
+    CaptureCode.CLOCK_STEPPED_BACK,
+)
+
+#: The codes about the LANE that triggers captures. One subject, and at a
+#: standalone site it is this process's own id: there is no lane to name.
+LANE_CODES: tuple[CaptureCode, ...] = (
+    CaptureCode.LANE_UNREACHABLE,
+    CaptureCode.LANE_REFUSED_US,
+    CaptureCode.LANE_CONTRACT_UNSUPPORTED,
+    CaptureCode.LANE_BACKLOG_LOST,
+)
+
+
+class CameraUnreachableCause(StrEnum):
+    """WHY nothing came back. CLOSED, and on the wire beside the code.
+
+    `camera_unreachable` folds four different repairs together -- a camera that
+    is off, a camera that is answering too slowly to be read inside its own
+    timeout, a camera whose own process failed, and a camera answering something
+    that is not a picture. They are one code because to this process they are
+    one fact, "I asked and I do not have an image"; they are told apart here
+    because they are not one repair.
+    """
+
+    #: The deadline passed. The body was still arriving, or was not arriving at
+    #: all: this process stopped reading rather than being held by one camera.
+    TIMEOUT = "timeout"
+    #: The socket failed, or nothing answered on it.
+    NETWORK = "network"
+    #: The camera's own process answered that it could not take the picture -- a
+    #: 5xx. The repair is at the camera either way, which is why it is here and
+    #: not under `camera_refused_us`.
+    SERVER_ERROR = "server_error"
+    #: Something came back and it was not a JPEG, or it was longer than
+    #: `[capture] max_snapshot_bytes`. A login page served as `image/jpeg` is
+    #: this one.
+    NOT_A_PICTURE = "not_a_picture"
+
+
+def _capture_never_alarm(code: CaptureCode) -> bool:
+    return CAPTURE_NEVER_ALARM[code]
+
+
+@dataclass(frozen=True, slots=True)
+class CameraDescription:
+    """One declared camera, as a consumer may see it.
+
+    `snapshot_url` is REBUILT from scheme, host, port and path -- the same rule
+    and the same function `GET /v1/monitor` uses. A credential in a snapshot URL
+    is refused at startup; this is the second half of that rule, so a credential
+    cannot ride out on this route because something found a way past the first
+    check. `authenticated` says a credential is configured. It is not the
+    credential.
+    """
+
+    camera_id: str
+    snapshot_url: str
+    authenticated: bool
+
+    def __post_init__(self) -> None:
+        _text(self.camera_id, "camera.camera_id")
+        _text(self.snapshot_url, "camera.snapshot_url")
+        parsed = urlsplit(self.snapshot_url)
+        if parsed.username or parsed.password:
+            raise ValueError(
+                "camera.snapshot_url has userinfo in URL: credentials come from files, and "
+                "this route publishes an address rather than a way in"
+            )
+        if not isinstance(self.authenticated, bool):
+            raise ValueError("camera.authenticated must be a bool")
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureDescription:
+    """`GET /v1/capture` -- who this process is, and what it is set to do.
+
+    The settings AS LOADED, so a site can see what the file it wrote actually
+    produced rather than what it meant. `directory` is here because where the
+    personal data is kept is the first question anybody asks of this process,
+    and the answer is a path on a box, not a credential.
+    """
+
+    capture_id: str
+    site_id: str
+    directory: str
+    interval_seconds: float
+    retention_days: int
+    max_bytes: int
+    #: The most this process reads from one camera before it stops reading. On
+    #: this route beside `max_bytes` because the relationship between the two is
+    #: what a site has to get right, and startup refuses it unless it is BELOW
+    #: `max_bytes`.
+    max_snapshot_bytes: int
+    cameras: tuple[CameraDescription, ...]
+    #: Whether a lane is declared. `false` is STANDALONE, and standalone is a
+    #: mode: a garage with a camera and no gate is a customer of this process,
+    #: not a degraded installation. It decides whether any record can ever carry
+    #: a lane event reference.
+    lane_declared: bool
+    #: The lane's address, rebuilt, or `null` when none is declared.
+    lane_url: str | None
+    contract_version: int = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        _text(self.capture_id, "capture_id")
+        _text(self.site_id, "site_id")
+        _text(self.directory, "directory")
+        if not self.cameras:
+            # The same refusal the configuration makes, held one layer lower so
+            # it cannot be routed around by building the payload some other way.
+            # A capture process with no camera photographs nothing and would
+            # describe itself as running.
+            raise ValueError("a capture process with no camera records nothing")
+        if not isinstance(self.lane_declared, bool):
+            raise ValueError("lane_declared must be a bool")
+        if self.lane_declared != (self.lane_url is not None):
+            raise ValueError("lane_declared and lane_url disagree about whether a lane exists")
+
+    def to_dict(self) -> dict:
+        return {
+            "capture_id": self.capture_id,
+            "site_id": self.site_id,
+            "contract_version": self.contract_version,
+            "directory": self.directory,
+            "interval_seconds": self.interval_seconds,
+            "retention_days": self.retention_days,
+            "max_bytes": self.max_bytes,
+            "max_snapshot_bytes": self.max_snapshot_bytes,
+            "lane_declared": self.lane_declared,
+            "lane_url": self.lane_url,
+            "cameras": [camera.to_dict() for camera in self.cameras],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureEntry:
+    """One capture code, its subject, its state, its source and its caveat.
+
+    The same entry shape a lane's health route publishes, field for field, so a
+    monitor reads this surface with the code that already reads a lane. `state`
+    is one of the three; `never_alarm` is a JSON boolean on every entry, never
+    absent, because absent and `false` point in opposite directions at whoever
+    reads it.
+    """
+
+    code: str
+    subject: str
+    state: str
+    #: The HTTP status the camera or the lane answered with, when the code is
+    #: about an ANSWER. `null` everywhere else.
+    status: int | None = None
+    #: WHY nothing came back, on `camera_unreachable` and nowhere else. `null`
+    #: on every other code, and `null` on this one until it has been measured:
+    #: one closed set, on the wire, so a monitor reading this surface can tell a
+    #: camera that is off from one that cannot be read inside its own timeout
+    #: without holding a second list of its own.
+    cause: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.code not in tuple(code.value for code in CaptureCode):
+            raise ValueError(f"{self.code!r} is not a capture code in this contract")
+        _text(self.subject, "subject")
+        if self.state not in tuple(state.value for state in HealthState):
+            raise ValueError(f"state must be one of {tuple(HealthState)}, got {self.state!r}")
+        if self.cause is not None:
+            if self.code != CaptureCode.CAMERA_UNREACHABLE.value:
+                raise ValueError(f"{self.code} does not carry a cause; got {self.cause!r}")
+            if self.cause not in tuple(cause.value for cause in CameraUnreachableCause):
+                raise ValueError(
+                    f"cause must be one of {tuple(CameraUnreachableCause)}, got {self.cause!r}"
+                )
+        if self.status is not None and (
+            isinstance(self.status, bool) or not isinstance(self.status, int)
+            or not 100 <= self.status <= 599
+        ):
+            raise ValueError(f"status must be an HTTP status code or null, got {self.status!r}")
+        if self.status is not None and self.code not in (
+            CaptureCode.CAMERA_REFUSED_US.value,
+            CaptureCode.LANE_REFUSED_US.value,
+        ):
+            raise ValueError(f"{self.code} does not carry an HTTP status; got {self.status!r}")
+        # The invariant, copied from the lane contract and from `MonitorEntry`,
+        # because it is the same invariant. `ok` and `active` are claims about a
+        # measurement, and a code this build does not derive may make neither.
+        if self.state != HealthState.UNKNOWN and self.source != Source.MEASURED:
+            raise ValueError(
+                f"{self.code} is {self.source.value} but claims state {self.state!r}. "
+                "Only a code this build derives may answer anything but 'unknown'."
+            )
+
+    @property
+    def source(self) -> Source:
+        return CAPTURE_SOURCES[CaptureCode(self.code)]
+
+    def to_dict(self) -> dict:
+        code = CaptureCode(self.code)
+        return {
+            "code": self.code,
+            "subject": self.subject,
+            "state": self.state,
+            "source": self.source.value,
+            "never_alarm": _capture_never_alarm(code),
+            "caveat": CAPTURE_CAVEATS.get(code),
+            "status": self.status,
+            "cause": self.cause,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StoreReads:
+    """What is on the disk, MEASURED from the directory when this is asked.
+
+    Every field here is a read. Nothing in this package has ever seen a capture
+    from any of the cameras it is written for, so this module states no size, no
+    rate and no capacity anywhere: what a site's disk does is answered by
+    pointing this route at that site's disk.
+
+    `projected_bytes_per_day` is derived from the last 24 hours and is `null`
+    under an hour of data -- a projection from four minutes is not a projection,
+    and publishing one would be a number that looks measured.
+    """
+
+    bytes_used: int
+    record_count: int
+    oldest_at: str | None
+    newest_at: str | None
+    mean_bytes_per_record: int | None
+    records_last_24h: int
+    bytes_last_24h: int
+    projected_bytes_per_day: int | None
+    #: How many records the purge has removed since this process started, and
+    #: why. Published because a store that is silently eating itself under a cap
+    #: that is too small looks exactly like a store nothing is happening at.
+    purged_by_age: int = 0
+    purged_by_size: int = 0
+    #: How many temporary files an index rebuild has removed since this process
+    #: started. A temporary file found at a rebuild is BY DEFINITION a write
+    #: that died -- a power cut in a gate housing -- and it is counted rather
+    #: than swept, because the number is how often that is happening at a site.
+    purged_by_crash: int = 0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureHealth:
+    """`GET /v1/capture/health` -- every capture code, and what is on the disk.
+
+    Refused at construction if one of the codes is missing or duplicated for a
+    subject, exactly as `MonitorHealth` is. An absent code is indistinguishable
+    from a healthy one to whoever reads this.
+    """
+
+    codes: tuple[CaptureEntry, ...] = field(default_factory=tuple)
+    store: StoreReads | None = None
+    #: Every camera this process was DECLARED with. Not published -- it is on
+    #: `GET /v1/capture`, where a reader looks for what this process is set to
+    #: do -- but held here because completeness is per `(code, subject)` and a
+    #: payload cannot be checked complete against a list it does not have.
+    camera_ids: tuple[str, ...] = field(default_factory=tuple)
+    #: How many lane events this process is known not to have followed, since it
+    #: started. `0` at a standalone site: there is no lane to miss events from.
+    lane_events_missed: int = 0
+
+    def __post_init__(self) -> None:
+        seen = [(entry.code, entry.subject) for entry in self.codes]
+        if len(seen) != len(set(seen)):
+            raise ValueError("a capture code appears twice for one subject in one payload")
+        missing = {code.value for code in CaptureCode} - {code for code, _ in seen}
+        if missing:
+            raise ValueError(
+                f"health payload is missing {sorted(missing)}. Every code ships every time: "
+                "one that is absent reads exactly like one that is fine. A code with no "
+                "subject yet ships once, `unknown`, under this process's own id."
+            )
+        # AND COMPLETE PER (CODE, CAMERA). A camera that has never produced a
+        # state is exactly the camera worth asking about -- the one that has not
+        # answered since the process started -- and under a per-CODE rule alone
+        # it disappears from this payload the moment any other camera reports.
+        absent = sorted(
+            (code.value, camera_id)
+            for code in CAMERA_CODES
+            for camera_id in self.camera_ids
+            if (code.value, camera_id) not in set(seen)
+        )
+        if absent:
+            raise ValueError(
+                f"health payload is missing {absent}. Every declared camera ships under every "
+                "camera code on every response, `unknown` until its first attempt: a camera "
+                "that is absent reads to a consumer exactly like a camera that is fine, and "
+                "the camera that has never answered is the one worth asking about."
+            )
+        if self.store is None:
+            raise ValueError("a capture health payload without the store's reads is half of one")
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "codes": [entry.to_dict() for entry in self.codes],
+            "store": self.store.to_dict(),
+            "lane_events_missed": self.lane_events_missed,
+        }
+
+
+#: WHAT `capture_minus_lane_event_ms` SPANS. **The one copy.** Published into
+#: `docs/CONTRACT.md` from here and held to it by a value test, so the sentence
+#: a reader acts on and the sentence this package believes cannot come apart.
+#:
+#: It is the monitor half's "`lane_gone_quiet`, and the two clocks it spans"
+#: applied to this field, for the same reason and with the same honesty: naming
+#: a subtraction across two machines as a delay is a number nobody measured
+#: wearing the label of one that was.
+CAPTURE_MINUS_LANE_EVENT_NOTE = (
+    "This is a SUBTRACTION ACROSS TWO CLOCKS: `captured_at` is read from this process's clock "
+    "and `lane_event_at` from the lane's. It is not a measured delay. A NEGATIVE VALUE IS "
+    "REACHABLE and is served -- it means the two clocks disagree by at least that much, with "
+    "the lane's ahead. Nothing here measures the offset between them, so nothing here can "
+    "separate the offset from the time this process took to see the event, and correcting it "
+    "would mean a second measurement nobody has made. Where the two clocks are the same box, "
+    "or are disciplined to the same source, it is the cost of this process being a CONSUMER of "
+    "the lane's contract rather than something the lane calls."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordRef:
+    """One stored capture, as the records route publishes it. SIDECAR ONLY.
+
+    The eight fields are the sidecar's, and there is nothing else in the sidecar
+    to publish. **No plate, no plate region, no vehicle attribute and no event
+    detail** -- not withheld here, absent from the store, which is why this
+    dataclass has nowhere to put one.
+
+    `image_url` is the route that serves the bytes. The bytes are never inline:
+    a records page a consumer polls is a page it polls often, and a JPEG on it
+    would make the cheapest read the most expensive one.
+    """
+
+    id: str
+    captured_at: str
+    camera_id: str
+    reason: str
+    #: The lane event this capture answers, by CURSOR and by the time the LANE
+    #: recorded, and nothing else from that event but its id below. Who the car
+    #: was lives at the lane's platform; the cursor is how this process polled
+    #: for the event, and the lane contract says it does not survive a restart.
+    lane_event_cursor: int | None
+    lane_event_at: str | None
+    #: The lane's own `event_id` for that event: THE DURABLE HALF of the join.
+    #: The cursor is not durable across a lane restart -- the lane contract says
+    #: so -- and `event_id` is the key the lane's platform keeps the event under.
+    #: `null` on an interval capture, on a record from a lane whose page carries
+    #: no `event_id`, and on every record written before this field existed.
+    #: ADDITIVE-OPTIONAL, AND NO INVARIANT TIES IT TO THE CURSOR: the sidecar has
+    #: no version, so a rule that required it beside `lane_event_cursor` would
+    #: refuse -- and the store would purge -- every lane-triggered record on
+    #: every disk written before it.
+    lane_event_id: str | None
+    #: `captured_at` minus `lane_event_at`, in milliseconds. NAMED FOR THE
+    #: SUBTRACTION IT IS, and what it spans is stated once, in
+    #: `CAPTURE_MINUS_LANE_EVENT_NOTE`, published into `docs/CONTRACT.md` from
+    #: that one copy. `null` on an interval capture, which has no lane event to
+    #: subtract.
+    capture_minus_lane_event_ms: int | None
+    bytes: int
+    image_url: str
+
+    def __post_init__(self) -> None:
+        _text(self.id, "record.id")
+        _iso_utc(self.captured_at, "captured_at")
+        _text(self.camera_id, "camera_id")
+        if self.reason not in tuple(reason.value for reason in CaptureReason):
+            raise ValueError(f"reason must be one of {tuple(CaptureReason)}, got {self.reason!r}")
+        if self.lane_event_at is not None:
+            _iso_utc(self.lane_event_at, "lane_event_at")
+        if self.lane_event_id is not None:
+            _text(self.lane_event_id, "lane_event_id")
+        if (self.lane_event_cursor is None) != (self.lane_event_at is None):
+            raise ValueError(
+                "a lane event reference is a cursor AND the time the lane recorded, or neither"
+            )
+        if (self.reason == CaptureReason.INTERVAL.value) != (self.lane_event_cursor is None):
+            raise ValueError(
+                f"reason={self.reason!r} and the lane event reference disagree about whether a "
+                "lane triggered this capture"
+            )
+        if (self.capture_minus_lane_event_ms is None) != (self.lane_event_at is None):
+            raise ValueError(
+                "capture_minus_lane_event_ms is present exactly when a lane event triggered "
+                "the capture: it is a subtraction, and there is nothing to subtract without one"
+            )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordPage:
+    """`GET /v1/capture/records?since=N` -- what has been stored.
+
+    Deliberately the same shape and the same semantics as the lane contract's
+    `GET /v1/lane/events`, field for field, so one consumer holds one cursor
+    policy for every surface in this estate.
+
+      * the cursor is **monotonic within one run** and is **NOT durable across a
+        restart**. The store is durable; the cursor over it is not. On start the
+        index is rebuilt by reading the directory and numbered from one in
+        capture order, so a saved position no longer refers to the same record
+        once anything has been purged;
+      * `since` ahead of this process's own cursor sets `reset`;
+      * `since` behind the oldest record still held also sets `reset`. Here the
+        window is the STORE, and what evicts from it is the retention rule and
+        the size cap -- so this flag is how a consumer learns that what it was
+        going to fetch has been deleted rather than simply not served;
+      * `dropped` is how many records the purge has removed since this process
+        started. A gap nobody knows about is worse than one that is counted.
+    """
+
+    cursor: int
+    reset: bool
+    dropped: int
+    records: tuple[dict, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "cursor": self.cursor,
+            "reset": self.reset,
+            "dropped": self.dropped,
+            "records": list(self.records),
+        }
+
+
+# ===========================================================================
+# THE AGENT
+#
+# The third process in this package, under the same `contract_version` as the
+# monitor and the capture process, because a consumer holds one compatibility
+# policy for this package and not three.
+#
+# **THE LANE DECIDES; THIS AGENT ASSERTS.** It answers an intercom, reads the
+# lane's last decision through the lane contract, speaks the case, calls a human
+# when the case needs one, and records what that human authorised. From version 2
+# an authorisation is also an ACT where a site declared one: `ACTS` below names
+# the two that reach `POST /v1/lane/vend`, and the lane applies its own refusals
+# to a human's completion exactly as it does to a driver's. A site that declared
+# no act token and no relay gets the same code asking for nothing.
+# ===========================================================================
+
+
+class AgentCase(StrEnum):
+    """WHY this driver is at the intercom, derived from the lane's own payload.
+
+    CLOSED, and derived rather than asked: the driver is not offered a menu of
+    problems to choose from, because a driver at a barrier does not know which
+    of these happened and a menu would make them guess. `cases.derive()` is a
+    pure function of `GET /v1/lane/state` and `GET /v1/lane/health`, with a test
+    per row of the table in `docs/CONTRACT.md`.
+
+    Every member but `nothing_to_do` ends with a human. That is not a placeholder
+    for cleverness that arrives later: this version has no completion path -- no
+    display code, no SMS, no voice plate read-back -- so a case that did not
+    reach a human would be a driver told to wait for something that is not
+    coming.
+    """
+
+    #: A malfunction is `active` on the lane and it is not one the lane marks
+    #: `never_alarm`. It comes FIRST: a lane that is broken cannot have its last
+    #: decision read as a fact about this vehicle.
+    MALFUNCTION_ACTIVE = "malfunction_active"
+    #: The lane's OWNER has closed it -- to everyone, or to all but pass and
+    #: monthly holders because the garage is full -- and the lane publishes
+    #: that on `lane`. After a malfunction and before the decision: the
+    #: driver is at a lane that is not taking cars by itself, whatever it
+    #: decided about this one, and only a person's word opens it.
+    LANE_CLOSED = "lane_closed"
+    #: The lane fell back because it obtained no read AT ALL. **Never "wipe your
+    #: plate"** -- the identification service is off, and telling a driver to
+    #: clean a plate that was never looked at is the standing acceptance of this
+    #: project broken in the module's first sentence.
+    IDENTIFICATION_UNAVAILABLE = "identification_unavailable"
+    PLATE_NOT_READ = "plate_not_read"
+    PLATE_UNCLEAR = "plate_unclear"
+    VEHICLE_NOT_RECOGNISED = "vehicle_not_recognised"
+    RULES_UNAVAILABLE = "rules_unavailable"
+    ENTRY_REFUSED = "entry_refused"
+    #: The lane says nothing was there. **This is the case the intercom exists
+    #: for.** The presence gate is unvalidated on real vehicles, and a real car
+    #: it wrongly refuses has no other recourse: there is a driver at the
+    #: barrier and the lane believes the lane is empty.
+    VEHICLE_NOT_DETECTED = "vehicle_not_detected"
+    ENTRY_NOT_CONFIRMED = "entry_not_confirmed"
+    #: The lane's decision is OLDER than `[cases] decision_max_age_seconds`. A
+    #: decision has an age, and a stale one is not a fact about the driver who
+    #: is standing at the barrier now -- it is a fact about whoever was there
+    #: when it was made. It is a person, and it is deliberately not
+    #: `nothing_to_do`: that is the one case that does not reach anybody, so it
+    #: is the one where being wrong costs the customer everything.
+    STALE_DECISION = "stale_decision"
+    #: The lane named a reason outside the contract's required subset. A lane
+    #: that is not ours has its own vocabulary and will. The contract's answer is
+    #: to ESCALATE, never to map it onto the nearest thing we know.
+    UNRECOGNISED_REASON = "unrecognised_reason"
+    #: The lane did not answer, refused us, or speaks a contract version this
+    #: build cannot read. Also the case for a lane whose payload this build
+    #: cannot parse: a half-read decision about a vehicle is worse than none.
+    LANE_UNAVAILABLE = "lane_unavailable"
+    #: This intercom is declared with no lane. **Not degraded** -- a garage with
+    #: an intercom and no lane is the whole product for that site, and every
+    #: call there is a human case from the first second.
+    STANDALONE = "standalone"
+    #: `allow`, and the transit is confirmed or pending. The button was pressed
+    #: after a normal entry. One message, and the call ends.
+    NOTHING_TO_DO = "nothing_to_do"
+
+
+#: The cases that end with a human. Derived from the one case that does not, so
+#: a case added without an answer to "does this reach a human?" cannot exist.
+HUMAN_CASES: tuple[AgentCase, ...] = tuple(
+    case for case in AgentCase if case is not AgentCase.NOTHING_TO_DO
+)
+
+
+class Authorisation(StrEnum):
+    """What a human told us to do. CLOSED, per-site enabled, and a RECORD always.
+
+    Every member is recorded. Two of them are also ACTS where a site declared
+    one -- `ACTS` below is that mapping, and it is the one place this package
+    says which authorities reach a vend. `OPEN_NOW` on a lane with an act token
+    commands one and the lane may still refuse it; on a lane without one, or at
+    a standalone intercom with no relay, the person is told this process cannot
+    ask for anything. Which of the two they get is decided by what the site
+    declared -- the same `Target.can_act` and declared-relay fields that
+    `AgentConfig.act_surface` renders -- and never by a fixed sentence: a human
+    who believes a barrier moved when it did not is worse off than one who was
+    never called, and so is one told nothing can move when something just did.
+    """
+
+    OPEN_NOW = "open_now"
+    OPEN_AND_FLAG = "open_and_flag"
+    DO_NOT_OPEN = "do_not_open"
+    HOLD = "hold"
+    TRANSFER = "transfer"
+
+
+#: Authorisations this contract HAD and no longer offers, accepted only when a
+#: record written before their removal is READ back. `call_back` -- digit 6, a
+#: call-back number keyed and ended with `#` -- was removed on 2026-10-31,
+#: and nothing offers it, accepts it or
+#: records it now; a record written before then may still say it, and a reader
+#: of the store must not refuse that record for saying it.
+RETIRED_AUTHORISATIONS: tuple[str, ...] = ("call_back",)
+
+
+#: WHICH DIGIT selects which authorisation. **Fixed and published, not per
+#: site.** A site enables a subset; it does not renumber the set. The person
+#: keying it is often the same person across several garages at three in the
+#: morning, and a mapping that moved between sites is a wrong barrier decided by
+#: muscle memory. A digit whose authorisation this site has not enabled is not
+#: accepted -- it is re-prompted, and then it is `nothing usable`.
+#:
+#: **6 IS NOT ASSIGNED**, and it is not to be reassigned: it was `call_back`
+#: until 2026-10-31, and a person who still keys it from habit must reach the
+#: re-prompt every other unknown digit reaches, never a different decision.
+AUTHORISATION_DIGITS: dict[str, Authorisation] = {
+    "1": Authorisation.OPEN_NOW,
+    "2": Authorisation.OPEN_AND_FLAG,
+    "3": Authorisation.DO_NOT_OPEN,
+    "4": Authorisation.HOLD,
+    "5": Authorisation.TRANSFER,
+}
+
+#: WHICH authorisations are an ACT, and what each one is called on the lane's
+#: own contract. **It was empty for two rounds and it is not now.**
+#:
+#: The values are `lane_controller.contract.VendAuthority`'s, spelt here because
+#: this package is a CONSUMER of that contract and may not import it. The copy
+#: is held to the real lane by `tests/test_agent_cases.py`, which reads the enum
+#: out of the INSTALLED package and requires the two to agree -- an authority
+#: invented here goes red, and so does one added there without an answer here.
+#:
+#: `DO_NOT_OPEN`, `HOLD` and `TRANSFER` are deliberately not on it.
+#: None of them opens anything, and a lane has no route for "the human said
+#: no": the record of that decision is this agent's, on its own event surface.
+ACTS: dict[Authorisation, str] = {
+    Authorisation.OPEN_NOW: "human_open_now",
+    Authorisation.OPEN_AND_FLAG: "human_open_and_flag",
+}
+
+#: THE LANE'S OWN REFUSAL CODES, and this is a COPY because it has to be.
+#:
+#: The operator hears one sentence per code when a vend is refused, and a
+#: sentence is a value in this repository -- so the set has to exist here, in a
+#: package that may not import `lane_controller`. It is held to the real lane by
+#: `tests/test_agent_cases.py`, which reads `VendRefusal` out of the INSTALLED
+#: package and requires the two to be equal in both directions: a code added
+#: there without a sentence here goes red, and so does a sentence for a code
+#: that does not exist.
+#:
+#: Unlike `reason`, this set is CLOSED by the lane contract and published in its
+#: document, so a third-party lane implementing that contract answers from it.
+VEND_REFUSALS: tuple[str, ...] = (
+    "no_vehicle",
+    "malfunction_active",
+    "geometry_incomplete",
+    "vehicle_too_close",
+    "decision_in_future",
+    "decision_stale",
+    "decision_mismatch",
+    "already_completed",
+    "not_completable",
+    "busy",
+)
+
+#: The authorisations that MEAN OPEN, derived from the act table so the two
+#: cannot come apart. It used to be a typed tuple with a comment claiming it was
+#: derived from a table that was empty -- which was true of the values and not
+#: of the mechanism, and the mechanism is what a later round relies on.
+#:
+#: **Whether one of them CAN act is not decided here.** It depends on the lane:
+#: an act token declared for it, and a ticket to name in the completion. The
+#: agent asks that at the moment a human keys a digit, and `operator.cannot_open`
+#: is spoken only where the answer is no. The DRIVER's sentence is on the same
+#: branch: `authorisation.<value>` where nothing can act and says so, and
+#: `authorisation.<value>.acting` -- keyed off this table -- where something
+#: can, because there the clause about what this system cannot do is false.
+OPENING_AUTHORISATIONS: tuple[Authorisation, ...] = tuple(ACTS)
+
+
+class AgentCode(StrEnum):
+    """The agent's own malfunctions. CLOSED, every member on every response."""
+
+    #: The UA lost its registration with the site's SIP registrar. **This is the
+    #: lane contract's `intercom_registration_lost`, measured where it can be
+    #: measured.** A lane cannot see whether the agent is registered; the agent
+    #: can, and it says so here. Both documents say this, in the same words, so
+    #: the two surfaces cannot come to disagree about which one knows.
+    SIP_REGISTRATION_LOST = "sip_registration_lost"
+    #: The user agent process did not answer its control socket. The agent is up
+    #: and cannot answer a call: that is the loudest thing it has to say.
+    UA_UNREACHABLE = "ua_unreachable"
+    #: The user agent answered with a version this build was not tested against.
+    #: The `schema_version` rule applied to a process.
+    UA_UNSUPPORTED_VERSION = "ua_unsupported_version"
+    #: A call arrived at an account no `[intercoms.*]` owns, or the user agent
+    #: refused one outright because it named no account it holds. The subject is
+    #: the AGENT: keying it on the caller would let anybody who can dial the
+    #: agent add a row per invented identity, and the identity is their claim.
+    CALL_FROM_UNDECLARED_INTERCOM = "call_from_undeclared_intercom"
+    #: The human did not answer inside `[escalation] no_answer_seconds`.
+    HUMAN_UNREACHABLE = "human_unreachable"
+    #: A line this site declared has no audio file. The agent refuses to
+    #: register at startup on this, so on a running agent it is how a file that
+    #: has gone missing since is reported rather than played as silence.
+    AUDIO_MISSING = "audio_missing"
+    #: The user agent kept refusing a line past `[speech] line_timeout_seconds`.
+    #: The subject is the LEG -- `driver` or `operator` -- because which one
+    #: cannot be spoken to decides what happens next: a driver who cannot be
+    #: told their case is escalated to a person, and a person who cannot be
+    #: briefed either ends the case rather than holding a call open in silence.
+    AUDIO_PLAYBACK_FAILED = "audio_playback_failed"
+    #: A declared lane could not be read. Per lane, under that lane's name.
+    LANE_UNAVAILABLE = "lane_unavailable"
+    #: A declared display could not be written, or its geometry has gone. Per
+    #: display, under that display's name. **The ticket is then not offered**:
+    #: a code minted for a screen that cannot show it is a stay nobody can
+    #: prove, and the case goes to a person exactly as at a call-only agent.
+    DISPLAY_UNAVAILABLE = "display_unavailable"
+    #: The lane answered a vend with a 401, a 403 or a 404. Per lane. **This is
+    #: not a refused vend** -- that is a 409 with a code from the lane's own
+    #: published set, and it means the lane considered the request. This means
+    #: it would not: the act token is wrong, or that lane is an older build with
+    #: no such route. The two send somebody to different machines.
+    LANE_ACT_REFUSED = "lane_act_refused"
+    #: An intercom's own relay did not answer. Per intercom. STANDALONE only:
+    #: where there is a lane, the lane moves its own barrier.
+    RELAY_UNREACHABLE = "relay_unreachable"
+    #: An intercom's own relay answered, and what it answered was no -- a
+    #: credential it will not accept, or a port it does not have. Per intercom.
+    RELAY_REFUSED_US = "relay_refused_us"
+    #: The durable record of a call could not be written. THE CALL GOES ON --
+    #: a driver at a barrier is not refused because a disk is full -- but the
+    #: account a platform reads of it is missing from this box, and that is
+    #: said rather than discovered at the exception.
+    RECORD_STORE_UNWRITABLE = "record_store_unwritable"
+
+
+#: WHERE each of the agent's codes gets its answer in this build. One copy, and
+#: the payload is built from it. Every one is `measured`: a code the agent could
+#: not derive would not be one of its own.
+AGENT_SOURCES: dict[AgentCode, Source] = dict.fromkeys(AgentCode, Source.MEASURED)
+
+#: Whether a code may wake a human. Travels on the wire with the code, the way
+#: the lane's and the capture process's do -- a monitor reads this package's
+#: answer rather than holding a second list of its own. Nothing here is
+#: `never_alarm`: every member is a reason a driver at a barrier cannot be
+#: helped.
+AGENT_NEVER_ALARM: dict[AgentCode, bool] = dict.fromkeys(AgentCode, False)
+
+
+class AgentEventKind(StrEnum):
+    """What the agent records. **No plate, ever, on any of them.**
+
+    The agent never reads `GET /v1/lane/events` and never reads a plate from
+    anywhere: `GET /v1/lane/state` carries `read_ref`, not a plate, and this
+    package does not read even that. So there is no plate here to leak, and
+    `AgentEvent` has nowhere to put one.
+    """
+
+    CALL_ANSWERED = "call_answered"
+    CASE_SPOKEN = "case_spoken"
+    HUMAN_CALLED = "human_called"
+    AUTHORISATION_RECEIVED = "authorisation_received"
+    #: The human did not pick up. The driver is told, and this is the record of
+    #: it -- named in the plan's own prose and absent from its list of events,
+    #: which is why it is here: a timer that fires and records nothing is a
+    #: timer nobody can audit.
+    HUMAN_UNREACHABLE = "human_unreachable"
+    #: The human answered and keyed nothing this site accepts.
+    NOTHING_USABLE = "nothing_usable"
+    #: A call this site cannot place: it arrived at an account no declared
+    #: intercom owns, or the user agent itself answered it `404 Not Found`
+    #: because it named no account at all. **Refused WITHOUT being answered**,
+    #: no lane read and none guessed. The record carries what the caller
+    #: claimed to be and nothing else, because a claim is all there was.
+    CALL_FROM_UNDECLARED_INTERCOM = "call_from_undeclared_intercom"
+    #: A call arrived while a case was already in progress and was refused
+    #: WITHOUT being answered, whoever it was from. One case at a time is a real
+    #: limit of this version and it is published on `GET /v1/agent` as
+    #: `concurrent_cases`, because the user agent's bridge is site-wide: a
+    #: second case bridged while the first is open would put two strangers and
+    #: two operators in one conversation. **Measured from the caller's side:**
+    #: the refusal is `486 Busy Here` after `180 Ringing`. The record carries
+    #: the identity the caller claimed.
+    CALL_REFUSED_BUSY = "call_refused_busy"
+    #: The case could not be SPOKEN -- neither to the driver nor, after the
+    #: escalation, to the person. The call is RELEASED rather than held open in
+    #: silence. It is its own kind because `case_spoken` is written when the
+    #: last file of the case has FINISHED, so its absence had to mean something
+    #: a reader can act on rather than a gap in the log.
+    CASE_NOT_SPOKEN = "case_not_spoken"
+    CALL_ENDED = "call_ended"
+    #: The calls a PREVIOUS agent process left up, released at startup with how
+    #: many there were. `Agent._reconnect()` has always dealt with the calls a
+    #: lost control socket left behind; `Agent.start()` dealt with nothing, so
+    #: an agent that died with two legs up left baresip holding both and a
+    #: restarted process ANSWERED THE NEXT CALL WITH THE ORPHANS STILL LIVE --
+    #: the user agent's bridge is site-wide, so the previous driver and the
+    #: previous operator were conferenced into a stranger's case.
+    #:
+    #: Written only when there was at least one. A record of nothing having
+    #: happened, on every start of every agent for ever, is noise in the window
+    #: that holds what did.
+    LEFTOVER_CALLS_RELEASED = "leftover_calls_released"
+    #: A ticket was minted and put on a display. Carries `ticket_id`, the lane
+    #: and the case -- **never the `ticket_ref`**, which is on no event, no read
+    #: route and no log line, and lives only in the ticket record.
+    TICKET_ISSUED = "ticket_issued"
+    #: Somebody at that barrier pressed the button while the ticket was pending.
+    #: **That is what binds the ticket to an arrival**, and it is the whole of
+    #: what the press proves: somebody is there. Whether a CAR is there is the
+    #: lane's question, read off its loop at vend time, and never this agent's.
+    TICKET_CONFIRMED = "ticket_confirmed"
+    #: The ticket will not be vended, and why. The reasons are a closed set in
+    #: `tickets.VOID_REASONS`.
+    TICKET_VOIDED = "ticket_voided"
+    #: The lane accepted the completion. **`vend_commanded`, never `vend_opened`
+    #: and never `opened`**: the boom is `no_source` on the lane's own health
+    #: surface, so nothing in this estate has measured a barrier moving, and a
+    #: record that said it did would be the first unmeasured claim in it.
+    VEND_COMMANDED = "vend_commanded"
+    #: The lane refused the completion, with ITS OWN code on the record.
+    VEND_REFUSED = "vend_refused"
+    #: A STANDALONE intercom's own relay was pulsed, on a human's word. Carries
+    #: the intercom, the port and the milliseconds -- and no credential.
+    #:
+    #: **Written only AFTER the unit answered as the document says.** It used to
+    #: be written before the request went out and stood whether the unit
+    #: refused, answered something else, or was not there at all -- so the one
+    #: machine-readable account of a barrier at a site with no platform said the
+    #: relay was pulsed when it was not.
+    RELAY_PULSED = "relay_pulsed"
+    #: The relay did NOT pulse, and `cause` says why in the words the relay
+    #: module used. Its own kind rather than an absence, because the absence of
+    #: `relay_pulsed` is also what a call that never reached `OPEN_NOW` looks
+    #: like, and a site with no platform has this event and nothing else.
+    RELAY_PULSE_FAILED = "relay_pulse_failed"
+    #: The driver was shown a code and TOLD SO in the call they were already on.
+    #: A ticket minted while somebody is on the phone is one the screen cannot
+    #: tell them about, and a press that confirmed it would vend a code they
+    #: never photographed.
+    TICKET_ON_SCREEN = "ticket_on_screen"
+    #: A declared screen's driver now says it is a different size. The frame is
+    #: re-rendered at the new geometry; the old one was being written at the old
+    #: stride, which a driver sees as diagonal noise while the agent believes a
+    #: code is up.
+    DISPLAY_GEOMETRY_CHANGED = "display_geometry_changed"
+
+
+@dataclass(frozen=True, slots=True)
+class IntercomDescription:
+    """One declared intercom: the site's LABEL for it, and the lane it belongs to.
+
+    `sip_uri` is what a site calls that door and what a person reads. It is
+    **not** what identifies a caller: that is the account the call arrived at,
+    whose user part is a secret and therefore appears on no surface at all. A
+    consumer that treated this as an identity would be treating a `From` header
+    as one.
+
+    `lane` is `null` for a STANDALONE intercom. That is a mode, not a gap: the
+    agent answers, greets, and calls a human, which is the whole job at a garage
+    with an intercom and no lane.
+    """
+
+    sip_uri: str
+    lane: str | None
+    #: Whether a driver at this door can be SHOWN a ticket. DERIVED from
+    #: `[intercoms.<uri>] display` naming a screen this agent opened at startup,
+    #: so it cannot say `true` for a door whose display refused.
+    has_display: bool = False
+    #: Whether this door has a relay of its own. STANDALONE ONLY: where there is
+    #: a lane, the lane moves its own barrier and this is `false`.
+    has_relay: bool = False
+
+    def __post_init__(self) -> None:
+        _text(self.sip_uri, "intercom.sip_uri")
+        if self.lane is not None:
+            _text(self.lane, "intercom.lane")
+        if self.has_relay and self.lane is not None:
+            raise ValueError(
+                "an intercom with a lane has no relay of its own. Where there is a lane, the "
+                "LANE writes the identity and moves its own barrier -- an agent pulsing a "
+                "second relay at the same gate would be a vend the lane has no record of."
+            )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class LaneCapability:
+    """One declared lane, and whether THIS AGENT can command a vend at it.
+
+    **`can_vend` here is about the AGENT and not about the lane**, and the
+    difference is stated because the two words are the same. It is `true` when
+    this agent holds an act token for that lane AND can mint a ticket to name in
+    the completion -- both, because a completion needs an identity.
+
+    **The LANE'S own `can_vend` is on the lane's own surface**, and a consumer
+    that wants it reads it there. Republishing it here would be this agent
+    making a claim about another machine, out of a read it may not have made
+    since the lane last restarted -- which is the shape of every stale
+    capability this project has had reported against it.
+    """
+
+    name: str
+    can_vend: bool
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class UserAgentDescription:
+    """The external SIP user agent this agent drives, and the version of it.
+
+    Published because it is an INSTALL REQUIREMENT and a consumer of this
+    surface is entitled to see which one is running and whether the agent is
+    talking to it. The control address is not here: it is a local socket, and
+    publishing where a process's control channel lives is publishing a way in.
+    """
+
+    kind: str
+    #: What the UA reported about itself, or `null` before it has answered once.
+    version: str | None
+    #: The versions this build was TESTED against. A UA outside them is refused
+    #: at startup -- the `schema_version` rule, applied to a process.
+    tested_versions: tuple[str, ...]
+    registered: bool | None
+    #: `[user_agent] reconnect_seconds`: the longest this build waits between
+    #: attempts to REOPEN the control socket after it is lost. Published because
+    #: a consumer reading `ua_unreachable` is entitled to know whether the agent
+    #: is trying to come back and how often.
+    reconnect_seconds: float = 0.0
+
+    def __post_init__(self) -> None:
+        _text(self.kind, "user_agent.kind")
+        if self.version is not None:
+            _text(self.version, "user_agent.version")
+        if not self.tested_versions:
+            raise ValueError("a user agent with no tested version has not been tested")
+        if self.registered is not None and not isinstance(self.registered, bool):
+            raise ValueError("user_agent.registered must be a bool or null")
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "version": self.version,
+            "reconnect_seconds": self.reconnect_seconds,
+            "tested_versions": list(self.tested_versions),
+            "registered": self.registered,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentDescription:
+    """`GET /v1/agent` -- who this agent is, and what it is set to do.
+
+    `can_vend` is here, PER LANE, and it is DERIVED rather than written down:
+    true where this agent holds an act token for that lane and a key to sign the
+    ticket a completion has to name. It read `false` everywhere for a long time
+    because `ACTS` was empty; the vend change filled it and the answer changed with it,
+    which is what deriving it was for. It is the same field, in the same words,
+    that the lane contract publishes for the same reason -- and it is this
+    AGENT's answer about itself, never a republished copy of the lane's.
+    """
+
+    agent_id: str
+    site_id: str
+    intercoms: tuple[IntercomDescription, ...]
+    #: Every declared lane, with what this agent can do at it. Empty for a
+    #: standalone-only site.
+    lanes: tuple[LaneCapability, ...]
+    user_agent: UserAgentDescription
+    driver_languages: tuple[str, ...]
+    operator_language: str
+    authorisations: tuple[str, ...]
+    event_window_depth: int
+    concurrent_cases: int
+    no_answer_seconds: float
+    nothing_usable_seconds: float
+    hold_reprompt_seconds: float
+    transfer_declared: bool
+    #: `[cases] decision_max_age_seconds`. Published because it decides which
+    #: driver gets a person, and a consumer cannot read the case table without
+    #: it.
+    decision_max_age_seconds: float
+    #: `[speech] line_timeout_seconds` and `name_audio_max_seconds`.
+    line_timeout_seconds: float
+    name_audio_max_seconds: float
+    #: `[records] retention_days` and `max_bytes`: how long the record of every
+    #: call is kept and the most of it this box keeps. The directory is not
+    #: published; the records are read through `GET /v1/agent/calls`.
+    record_retention_days: int | None = None
+    record_max_bytes: int | None = None
+    contract_version: int = CONTRACT_VERSION
+
+    def __post_init__(self) -> None:
+        _text(self.agent_id, "agent_id")
+        _text(self.site_id, "site_id")
+        if not self.intercoms:
+            raise ValueError(
+                "an agent with no intercom answers nothing and would publish a working "
+                "surface while doing it"
+            )
+        if not self.driver_languages:
+            raise ValueError("an agent with no driver language plays a driver silence")
+        _text(self.operator_language, "operator_language")
+        if not self.authorisations:
+            raise ValueError(
+                "an agent with no authorisation enabled would call a human who can authorise "
+                "nothing"
+            )
+        for value in self.authorisations:
+            if value not in tuple(a.value for a in Authorisation):
+                raise ValueError(f"{value!r} is not an authorisation in this contract")
+        if isinstance(self.event_window_depth, bool) or not isinstance(
+            self.event_window_depth, int
+        ) or self.event_window_depth <= 0:
+            raise ValueError("event_window_depth must be a positive number of events")
+
+    @property
+    def can_vend(self) -> bool:
+        """Whether this agent can command a vend ANYWHERE. Derived from the
+        per-lane answers, which are themselves derived -- so it cannot say
+        `false` while a lane below it says `true`, and it is a summary rather
+        than a second opinion.
+
+        It was `bool(ACTS)` for two rounds, which asked whether an act existed
+        AT ALL. That is now true everywhere and answers nothing about a site: an
+        agent with an act table and no act token opens nothing.
+        """
+        return any(lane.can_vend for lane in self.lanes)
+
+    def to_dict(self) -> dict:
+        return {
+            "agent_id": self.agent_id,
+            "site_id": self.site_id,
+            "contract_version": self.contract_version,
+            "can_vend": self.can_vend,
+            "intercoms": [intercom.to_dict() for intercom in self.intercoms],
+            "lanes": [lane.to_dict() for lane in self.lanes],
+            "user_agent": self.user_agent.to_dict(),
+            "languages": {
+                "driver": list(self.driver_languages),
+                "operator": self.operator_language,
+            },
+            "authorisations": list(self.authorisations),
+            "event_window_depth": self.event_window_depth,
+            "concurrent_cases": self.concurrent_cases,
+            "escalation": {
+                "no_answer_seconds": self.no_answer_seconds,
+                "nothing_usable_seconds": self.nothing_usable_seconds,
+                "hold_reprompt_seconds": self.hold_reprompt_seconds,
+                "transfer_declared": self.transfer_declared,
+            },
+            "cases": {"decision_max_age_seconds": self.decision_max_age_seconds},
+            "speech": {
+                "line_timeout_seconds": self.line_timeout_seconds,
+                "name_audio_max_seconds": self.name_audio_max_seconds,
+            },
+            "records": {
+                "retention_days": self.record_retention_days,
+                "max_bytes": self.record_max_bytes,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEntry:
+    """One of the agent's codes, its subject, its state and its source."""
+
+    code: str
+    subject: str
+    state: str
+
+    def __post_init__(self) -> None:
+        if self.code not in tuple(code.value for code in AgentCode):
+            raise ValueError(f"{self.code!r} is not an agent code in this contract")
+        _text(self.subject, "subject")
+        if self.state not in tuple(state.value for state in HealthState):
+            raise ValueError(f"state must be one of {tuple(HealthState)}, got {self.state!r}")
+        # The invariant, copied from the lane contract because it is the same
+        # invariant: `ok` and `active` are claims about a measurement.
+        if self.state != HealthState.UNKNOWN and self.source != Source.MEASURED:
+            raise ValueError(
+                f"{self.code} is {self.source.value} but claims state {self.state!r}"
+            )
+
+    @property
+    def source(self) -> Source:
+        return AGENT_SOURCES[AgentCode(self.code)]
+
+    @property
+    def never_alarm(self) -> bool:
+        return AGENT_NEVER_ALARM[AgentCode(self.code)]
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "subject": self.subject,
+            "state": self.state,
+            "source": self.source.value,
+            "never_alarm": self.never_alarm,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentHealth:
+    """`GET /v1/agent/health` -- every code, every time.
+
+    Entries are in the LANE's shape -- `state`, `source`, `never_alarm` on the
+    wire -- so the monitor reads this with the code that already reads a lane and
+    a capture process. One reader, one passthrough rule, no third dialect.
+    """
+
+    codes: tuple[AgentEntry, ...] = field(default_factory=tuple)
+    #: The call-record store, as READS -- the same block, in the same words, as
+    #: the monitor's. See `records.RecordStore.reads`.
+    records: dict | None = None
+
+    def __post_init__(self) -> None:
+        seen = [(entry.code, entry.subject) for entry in self.codes]
+        if len(seen) != len(set(seen)):
+            raise ValueError("an agent code appears twice for one subject in one payload")
+        missing = {code.value for code in AgentCode} - {code for code, _ in seen}
+        if missing:
+            raise ValueError(
+                f"health payload is missing {sorted(missing)}. Every code ships every time: "
+                "one that is absent reads exactly like one that is fine."
+            )
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "codes": [entry.to_dict() for entry in self.codes],
+            "records": self.records,
+        }
+
+
+#: The event kinds that are ABOUT one ticket, and therefore name it. DERIVED
+#: from the names rather than listed, so a kind added for tickets carries the
+#: rule without anybody adding it to a second place -- and `relay_pulsed` is
+#: deliberately outside it: a standalone relay is pulsed on a human's word and
+#: the ticket, where a display exists at all, is a separate record.
+TICKET_EVENT_KINDS: frozenset[str] = frozenset(
+    kind.value
+    for kind in AgentEventKind
+    if kind.value.startswith("ticket_") or kind.value.startswith("vend_")
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEvent:
+    """One thing the agent did. **There is no field here for a plate.**
+
+    `intercom` is the DECLARED name of the door -- the `[intercoms.<sip-uri>]`
+    key -- and `human` the identity the operator leg was placed to or answered
+    from. Both are addresses a site declared, not people: this surface says which
+    door and which rota, and a consumer that wants to know who was on shift asks
+    the rota.
+
+    **`caller_stated_identity` is the one field on this surface that a caller
+    supplies, and it is labelled as a claim in its own name.** It is the `From`
+    header of the call. It is not what identified the intercom -- that is the
+    account the call arrived at, which never appears here because its user part
+    is a secret -- and a consumer that treats it as an identity has been told in
+    the field's name that it is not one. On a refusal it is the whole record of
+    who tried.
+    """
+
+    kind: str
+    site_id: str
+    agent_id: str
+    intercom: str
+    lane: str | None
+    case: str | None
+    authorisation: str | None
+    human: str | None
+    at: str
+    #: ALWAYS `null` from this build. It carried the number keyed with
+    #: `call_back`, which was removed on 2026-10-31 (`RETIRED_AUTHORISATIONS`);
+    #: no authorisation left carries a value. KEPT, rather than dropped, so a
+    #: reader written against the field keeps working -- removing a field is a
+    #: change a consumer notices. Still DIGITS ONLY if it is ever set, because a
+    #: field a caller fills is the field a plate ends up in.
+    keyed: str | None = None
+    #: What the caller's `From` header SAID, reduced to `sip:user@host`. A
+    #: CLAIM, never a check: anybody who can send an INVITE can write any value
+    #: here. `null` when the user agent did not report one.
+    caller_stated_identity: str | None = None
+    #: HOW MANY calls a previous process had left up, on `leftover_calls_released`
+    #: and `null` on every other kind. A count and not a list: the call ids are
+    #: the previous process's bookkeeping and mean nothing to a reader of this
+    #: surface, and what a site needs to know is that there were some.
+    released: int | None = None
+    #: WHICH TICKET, on every ticket and vend event. The agent's own opaque
+    #: handle, and it is the vend's `Idempotency-Key`.
+    #:
+    #: **The `ticket_ref` is NOT here and is on no event at all.** It is what a
+    #: person reads out and what an exit will scan; it identifies one stay and
+    #: is personal data while that stay exists. It lives in the ticket record
+    #: and nowhere else on this box, which is what makes the retention rule mean
+    #: something.
+    ticket_id: str | None = None
+    #: WHO said to open, on `vend_commanded` and `vend_refused`: a member of the
+    #: lane contract's `VendAuthority`, verbatim.
+    authorised_by: str | None = None
+    #: The LANE'S OWN refusal code, on `vend_refused`. Never translated: a lane
+    #: that is not ours has its own vocabulary and the contract requires a
+    #: consumer to escalate on one it does not recognise rather than map it onto
+    #: the nearest thing it knows.
+    code: str | None = None
+    #: WHY a ticket was voided, on `ticket_voided`. A member of
+    #: `tickets.VOID_REASONS`.
+    reason: str | None = None
+    #: The lane's own event cursor at the moment it accepted, on
+    #: `vend_commanded`. **Not a `completion_id`:** the lane's 202 carries
+    #: `event_cursor` and `transit` and nothing else, and the completion's own
+    #: identifier is minted onto the lane's `assisted_identity` event. This is
+    #: the join to that record.
+    lane_event_cursor: int | None = None
+    #: WHICH PORT of an intercom's relay was pulsed, and for how long, on
+    #: `relay_pulsed` and on `relay_pulse_failed`. No credential, ever.
+    relay_port: int | None = None
+    relay_ms: int | None = None
+    #: WHY the pulse did not happen, on `relay_pulse_failed`: the sentence the
+    #: relay module raised, which names the unit's own answer or its silence.
+    #: **Never a credential** -- the two refusals are built from a status, a
+    #: challenge's scheme and its missing fields, and never from the password
+    #: they authenticate with.
+    cause: str | None = None
+    #: WHICH SCREEN, and what its driver now says it is, on
+    #: `display_geometry_changed`. The geometry is `<width>x<height>@<bpp>`,
+    #: which is what decides the stride a frame is written at.
+    display: str | None = None
+    geometry: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in tuple(kind.value for kind in AgentEventKind):
+            raise ValueError(f"{self.kind!r} is not an agent event kind in this contract")
+        _text(self.site_id, "site_id")
+        _text(self.agent_id, "agent_id")
+        _text(self.intercom, "intercom")
+        _iso_utc(self.at, "at")
+        if self.case is not None and self.case not in tuple(case.value for case in AgentCase):
+            raise ValueError(f"{self.case!r} is not a case in this contract")
+        if self.authorisation is not None and self.authorisation not in tuple(
+            value.value for value in Authorisation
+        ):
+            raise ValueError(f"{self.authorisation!r} is not an authorisation in this contract")
+        if self.released is not None and (
+            not isinstance(self.released, int)
+            or isinstance(self.released, bool)
+            or self.released < 1
+        ):
+            raise ValueError(
+                f"released must be a whole number of calls, at least one, or null, got "
+                f"{self.released!r}. It is written only when there were leftovers, so a zero "
+                "here would be a record of nothing having happened."
+            )
+        if self.ticket_id is not None and self.kind not in TICKET_EVENT_KINDS:
+            raise ValueError(
+                f"{self.kind!r} carries no ticket_id in this contract. A ticket id on an "
+                "event that is not about a ticket has nothing to identify."
+            )
+        if self.kind in TICKET_EVENT_KINDS and not self.ticket_id:
+            raise ValueError(
+                f"{self.kind!r} is about one ticket and must name it. An event that says a "
+                "ticket happened without saying which cannot be joined to anything."
+            )
+        if self.reason is not None and self.reason not in VOID_REASONS:
+            raise ValueError(
+                f"{self.reason!r} is not a void reason in this contract. The set is closed "
+                "so a consumer can branch on it."
+            )
+        if (self.released is not None) != (
+            self.kind == AgentEventKind.LEFTOVER_CALLS_RELEASED.value
+        ):
+            raise ValueError(
+                "released belongs on leftover_calls_released and on no other kind, and that "
+                "kind carries it: a count on another event has nothing to count, and that "
+                "event without one says only that something happened."
+            )
+        if self.cause is not None and self.kind != AgentEventKind.RELAY_PULSE_FAILED.value:
+            raise ValueError(
+                f"{self.kind!r} carries no cause in this contract. A cause belongs to the "
+                "one event that says something did not happen."
+            )
+        if self.kind == AgentEventKind.RELAY_PULSE_FAILED.value and not self.cause:
+            raise ValueError(
+                "relay_pulse_failed must say why. An event recording that a barrier did not "
+                "move, with no cause on it, sends nobody anywhere."
+            )
+        if (self.display is not None or self.geometry is not None) and (
+            self.kind != AgentEventKind.DISPLAY_GEOMETRY_CHANGED.value
+        ):
+            raise ValueError(
+                f"{self.kind!r} carries no display or geometry in this contract."
+            )
+        if self.kind == AgentEventKind.DISPLAY_GEOMETRY_CHANGED.value and not (
+            self.display and self.geometry
+        ):
+            raise ValueError(
+                "display_geometry_changed names the screen and what it now says it is. "
+                "Either alone cannot be acted on."
+            )
+        if self.keyed is not None and (not self.keyed or not self.keyed.isdigit()):
+            raise ValueError(
+                f"keyed must be digits or null, got {self.keyed!r}. It is the only value on "
+                "this surface a caller supplies, and a field a caller fills is the field a "
+                "plate ends up in."
+            )
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AgentEventPage:
+    """`GET /v1/agent/events?since=N` -- the same cursor shape as every other.
+
+    Field for field the lane's, the monitor's and the capture process's, so one
+    consumer holds one cursor policy for all of them: the cursor is monotonic
+    within one run and not durable across a restart, `since` ahead of it or
+    behind the oldest event still held sets `reset`, and `dropped` counts what
+    the window evicted.
+    """
+
+    cursor: int
+    reset: bool
+    dropped: int
+    events: tuple[dict, ...] = field(default_factory=tuple)
+
+    def to_dict(self) -> dict:
+        return {
+            "contract_version": CONTRACT_VERSION,
+            "cursor": self.cursor,
+            "reset": self.reset,
+            "dropped": self.dropped,
+            "events": list(self.events),
+        }
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/agent/calls -- the DURABLE record of every call the agent handled
+# ---------------------------------------------------------------------------
+
+
+class CallDisposition(StrEnum):
+    """Whether a call was answered at all, and why not."""
+
+    ANSWERED = "answered"
+    #: A case was in progress, so it was refused unanswered -- `486 Busy Here`.
+    #: Nobody looked at who it was, by design, so it has no lane.
+    REFUSED_BUSY = "refused_busy"
+    #: It arrived at an account no intercom declares, or the user agent refused
+    #: it outright. No lane, because there is no door to name.
+    REFUSED_UNDECLARED = "refused_undeclared"
+
+
+class CallOutcome(StrEnum):
+    """How an ANSWERED call ended, in one word. `null` while it is live.
+
+    The timeline on the record says everything that happened; this says which
+    of a closed set of endings it was, so a consumer can filter on it without
+    replaying the timeline -- and it is set where the agent KNOWS it, never
+    inferred afterwards from what is missing.
+    """
+
+    #: The person keyed an authorisation this site enabled. Which one, and what
+    #: was keyed with it, are on the record.
+    AUTHORISATION_RECEIVED = "authorisation_received"
+    #: The person did not pick up inside `no_answer_seconds`, or could not be
+    #: dialled at all.
+    HUMAN_UNREACHABLE = "human_unreachable"
+    #: The person answered and keyed nothing this site accepts in time.
+    NOTHING_USABLE = "nothing_usable"
+    #: The person answered and hung up before keying anything.
+    OPERATOR_HUNG_UP = "operator_hung_up"
+    #: The driver's press confirmed the ticket on the screen. No person.
+    TICKET_CONFIRMED = "ticket_confirmed"
+    #: A ticket was on the screen that the driver had not been told about; they
+    #: were told where to look. No person.
+    TOLD_TICKET_ON_SCREEN = "told_ticket_on_screen"
+    #: The lane published nothing a person was needed for. No person.
+    NOTHING_TO_DO = "nothing_to_do"
+    #: The user agent would not play the case to anybody, and the call was
+    #: released rather than held open in silence.
+    CASE_NOT_SPOKEN = "case_not_spoken"
+    #: The user agent's control socket was lost mid-case; what was said while
+    #: nobody was listening cannot be known.
+    USER_AGENT_LOST = "user_agent_lost"
+    #: The driver's leg closed before any of the endings above.
+    DRIVER_HUNG_UP = "driver_hung_up"
+    #: The agent stopped while the call was live. Found at the next start, and
+    #: said, rather than left looking like a call still in progress.
+    INTERRUPTED_BY_RESTART = "interrupted_by_restart"
+
+
+#: The agent event kinds a call's timeline can hold: every kind this agent
+#: records about a call it is on. The ticket and display kinds a POLL writes
+#: belong to a lane, not a call, and appear only when this call wrote them.
+CALL_TIMELINE_KINDS: frozenset[str] = frozenset(
+    kind.value
+    for kind in AgentEventKind
+    if kind.value not in ("leftover_calls_released", "display_geometry_changed")
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CallRecord:
+    """One call the agent handled, kept, and served on the calls route.
+
+    The summary fields answer the questions an exception asks -- which lane,
+    when, who was rung, who answered, what they keyed -- and `events` is the
+    timeline: every agent event this call produced, as `GET /v1/agent/events`
+    served it, so nothing on that route is lost when its window turns over.
+
+    `lane` is the AGENT'S name for the lane -- the `[lanes.<name>]` the dialled
+    account's intercom declares -- because that is what the dialled account
+    identifies. It is not the lane's own `lane_id`; a site maps one to the other
+    once, in its own configuration.
+
+    `person_called` and `person_answered_as` are ADDRESSES: the rota address a
+    site declared and the address the user agent reported for the leg that
+    answered. Neither is a person: a rota that rings three handsets answers as
+    the rota, and nothing here can see which handset. `keyed` is ALWAYS `null`
+    from this build: it held the call-back number keyed with `call_back`, which
+    was removed on 2026-10-31, and it is kept so a reader of older records --
+    which may still carry one, and `authorisation: "call_back"` -- keeps working.
+    `recording` is `null`: this version records no audio, and the field is
+    here so the round that does fills it rather than inventing a place.
+    """
+
+    call_id: str
+    site_id: str
+    agent_id: str
+    disposition: str
+    intercom: str
+    lane: str | None
+    caller_stated_identity: str | None
+    started_at: str
+    case: str | None = None
+    case_spoken_at: str | None = None
+    person_called: str | None = None
+    rang_person_at: str | None = None
+    person_answered_at: str | None = None
+    person_answered_as: str | None = None
+    authorisation: str | None = None
+    authorisation_at: str | None = None
+    keyed: str | None = None
+    ticket_id: str | None = None
+    ended_at: str | None = None
+    outcome: str | None = None
+    recording: str | None = None
+    events: tuple[dict, ...] = ()
+    #: How many digits the person keyed while a re-prompt was still playing,
+    #: which were dropped unread. A COUNT and never the digits.
+    digits_ignored: int = 0
+    revision: int = 0
+
+    def __post_init__(self) -> None:
+        _text(self.call_id, "call_id")
+        _text(self.site_id, "site_id")
+        _text(self.agent_id, "agent_id")
+        if self.disposition not in tuple(one.value for one in CallDisposition):
+            raise ValueError(f"disposition must be one of {tuple(CallDisposition)}")
+        _text(self.intercom, "intercom")
+        _iso_utc(self.started_at, "started_at")
+        for name in (
+            "case_spoken_at", "rang_person_at", "person_answered_at", "authorisation_at",
+            "ended_at",
+        ):
+            _optional_iso(getattr(self, name), name)
+        if self.case is not None and self.case not in tuple(one.value for one in AgentCase):
+            raise ValueError(f"{self.case!r} is not a case in this contract")
+        if self.authorisation is not None and self.authorisation not in tuple(
+            one.value for one in Authorisation
+        ) + RETIRED_AUTHORISATIONS:
+            raise ValueError(f"{self.authorisation!r} is not an authorisation in this contract")
+        if self.keyed is not None and not self.keyed.isdigit():
+            # The one field a CALLER'S side fills, and the field a plate would
+            # end up in. Digits, or nothing -- the rule the events route keeps.
+            raise ValueError("keyed is digits only")
+        if self.outcome is not None and self.outcome not in tuple(
+            one.value for one in CallOutcome
+        ) + tuple(one.value for one in CallDisposition):
+            raise ValueError(f"{self.outcome!r} is not a call outcome in this contract")
+        if isinstance(self.digits_ignored, bool) or not isinstance(
+            self.digits_ignored, int
+        ) or self.digits_ignored < 0:
+            raise ValueError("digits_ignored is a count")
+        if self.disposition != CallDisposition.ANSWERED and self.lane is not None:
+            raise ValueError("a refused call was never placed at a door, so it has no lane")
+        for event in self.events:
+            if event.get("kind") not in CALL_TIMELINE_KINDS:
+                raise ValueError(f"{event.get('kind')!r} is not a call event")
+
+    def to_dict(self) -> dict:
+        return {
+            "call_id": self.call_id,
+            "revision": self.revision,
+            "site_id": self.site_id,
+            "agent_id": self.agent_id,
+            "disposition": self.disposition,
+            "intercom": self.intercom,
+            "lane": self.lane,
+            "caller_stated_identity": self.caller_stated_identity,
+            "started_at": self.started_at,
+            "case": self.case,
+            "case_spoken_at": self.case_spoken_at,
+            "person_called": self.person_called,
+            "rang_person_at": self.rang_person_at,
+            "person_answered_at": self.person_answered_at,
+            "person_answered_as": self.person_answered_as,
+            "authorisation": self.authorisation,
+            "authorisation_at": self.authorisation_at,
+            "keyed": self.keyed,
+            "ticket_id": self.ticket_id,
+            "ended_at": self.ended_at,
+            "outcome": self.outcome,
+            "recording": self.recording,
+            "digits_ignored": self.digits_ignored,
+            "events": [dict(event) for event in self.events],
+        }
+
+    @classmethod
+    def from_dict(cls, body: dict) -> CallRecord:
+        known = {name for name in cls.__dataclass_fields__}
+        fields = {key: value for key, value in body.items() if key in known}
+        fields["events"] = tuple(body.get("events") or ())
+        fields["revision"] = int(body.get("revision") or 0)
+        return cls(**fields)
+
+
+def call_record_unfinished(body: dict) -> bool:
+    """Whether a STORED call record was written while its call was still live.
+
+    On `outcome`, not on `ended_at`: a call the last run never finished is closed
+    as `interrupted_by_restart` with `ended_at` still `null` -- nobody knows when
+    it ended -- and it must not be found again at every start after.
+    """
+    return body.get("disposition") == CallDisposition.ANSWERED.value and not body.get("outcome")
