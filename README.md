@@ -1,5 +1,7 @@
 # Open Parking AI — gate agent
 
+> **Vehicle ID is not in these repositories.** It is Open Parking AI's own vehicle identification service, which recognises a car from its pictures, colour, shape and plate together. Garage owners can use it **free, through an API**: ask for access at [openparking.ai](https://openparking.ai). Once we have confirmed you run a real garage, we send you your key.
+
 The intercom module. It ships **three processes**. Two of them open nothing; the
 third can ask a barrier to move, where a site configured it to.
 

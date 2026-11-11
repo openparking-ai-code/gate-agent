@@ -41,7 +41,7 @@ dev = [
   "pytest>=8",
   "ruff>=0.8",
   "opencv-python-headless>=4.10",
-  "openparking-lane-controller @ git+https://github.com/openparking-ai-code/lane-controller@6b780f702d3520889aea2beb892ba57fc5d0c234",
+  "openparking-lane-controller @ git+https://github.com/openparking-ai-code/lane-controller@8898eedad006d6ede5791d6902a63c7521f6724d",
 ]
 
 [project.scripts]
