@@ -83,6 +83,7 @@ ROWS = [
     ("fallback", "low_confidence", "none", (), AgentCase.PLATE_UNCLEAR),
     ("fallback", "unknown_vehicle", "none", (), AgentCase.VEHICLE_NOT_RECOGNISED),
     ("fallback", "stale_rules", "none", (), AgentCase.RULES_UNAVAILABLE),
+    ("fallback", "exit_not_settled", "none", (), AgentCase.EXIT_NOT_SETTLED),
     ("deny", "deny", "none", (), AgentCase.ENTRY_REFUSED),
     ("no_vehicle", "no_vehicle", "none", (), AgentCase.VEHICLE_NOT_DETECTED),
     ("allow", "allow", "held", (), AgentCase.ENTRY_NOT_CONFIRMED),

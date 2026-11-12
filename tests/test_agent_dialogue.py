@@ -971,3 +971,30 @@ def test_a_call_at_a_closed_lane_hears_lane_closed_and_the_person_is_told(
         tmp_path / "open", url, driver_languages=(language,), operator_language=language
     )
     assert f"{language}/case.lane_closed.wav" not in files(ua, "driver")
+
+
+# ---------------------------------------------------------------------------
+# A call at an exit that is not settled
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("language", ["en", "es-ES"])
+def test_a_call_at_an_unsettled_exit_hears_it_and_the_person_is_told(tmp_path, lane, language):
+    """The lane decided `fallback` `exit_not_settled`: the driver hears that their
+    exit is not settled yet and goes to a person, who is told the car has not paid
+    and has not been let out."""
+    served, url = lane
+    served.decision = {**served.decision, "reason": "exit_not_settled",
+                       "fallback": "exit_not_settled", "cause": None}
+    _agent, ua, _clock, _operator = brief_and_bridge(
+        tmp_path, url, driver_languages=(language,), operator_language=language
+    )
+    assert f"{language}/case.exit_not_settled.wav" in files(ua, "driver")
+    assert f"{language}/operator_case.exit_not_settled.wav" in files(ua, "operator")
+    assert f"{language}/case.unrecognised_reason.wav" not in files(ua, "driver")
+    # The control: the same lane with another reason is not this case.
+    served.decision = {**served.decision, "reason": "stale_rules", "fallback": "stale_rules"}
+    _agent, ua, _clock, _operator = brief_and_bridge(
+        tmp_path / "other", url, driver_languages=(language,), operator_language=language
+    )
+    assert f"{language}/case.exit_not_settled.wav" not in files(ua, "driver")

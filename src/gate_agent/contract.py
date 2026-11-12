@@ -1802,6 +1802,11 @@ class AgentCase(StrEnum):
     PLATE_UNCLEAR = "plate_unclear"
     VEHICLE_NOT_RECOGNISED = "vehicle_not_recognised"
     RULES_UNAVAILABLE = "rules_unavailable"
+    #: An EXIT the lane could not settle on its own copy: the stay is not paid,
+    #: priced from the driver's word, or let out by a person yet. The barrier
+    #: opens only when the platform says the case is settled, so the driver is
+    #: told that and goes to a person -- who can still let the car out.
+    EXIT_NOT_SETTLED = "exit_not_settled"
     ENTRY_REFUSED = "entry_refused"
     #: The lane says nothing was there. **This is the case the intercom exists
     #: for.** The presence gate is unvalidated on real vehicles, and a real car

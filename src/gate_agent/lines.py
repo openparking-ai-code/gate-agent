@@ -218,6 +218,12 @@ TEXT: dict[str, dict[str, str]] = {
         "en": "This lane is closed. I am connecting you to a person.",
         "es-ES": "Este carril está cerrado. Le paso con una persona.",
     },
+    # An exit that is not settled yet: not paid, not priced from the driver's
+    # word, not let out by a person. The person can still let the car out.
+    "case.exit_not_settled": {
+        "en": "Your exit is not settled yet. I am connecting you to a person.",
+        "es-ES": "Su salida aún no está liquidada. Le paso con una persona.",
+    },
     # NEVER an instruction about the plate. The identification service is off,
     # and telling somebody to clean a plate nothing looked at is the failure
     # this whole module was reordered around.
@@ -360,6 +366,10 @@ TEXT: dict[str, dict[str, str]] = {
     "operator_case.lane_closed": {
         "en": "This lane is closed by its owner.",
         "es-ES": "El propietario ha cerrado este carril.",
+    },
+    "operator_case.exit_not_settled": {
+        "en": "The car at this exit has not paid and has not been let out yet.",
+        "es-ES": "El coche de esta salida no ha pagado y todavía no se le ha dejado salir.",
     },
     "operator_case.identification_unavailable": {
         "en": "Vehicle identification is unavailable.",

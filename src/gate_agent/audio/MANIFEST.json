@@ -3,14 +3,14 @@
   "tool_version": "eSpeak NG text-to-speech: 1.52.0",
   "text_provenance": {
     "en": {
-      "written_by": "The Claude Code session that built this module, 2026-08-30, commit 5084a76 on openparking-ai-code/gate-agent -- EXCEPT the two `vehicle_too_close` lines (`ticket.vend_refused.vehicle_too_close` and `operator.vend_refused.vehicle_too_close`), added 2026-09-20 by a later session when the lane's refusal set gained that code. The driver's English sentence was approved by the owner in its final wording; the operator's was reported to the owner and not objected to. AND EXCEPT the two `lane_closed` lines (`case.lane_closed` and `operator_case.lane_closed`), added 2026-10-06 by a later session: the driver's first sentence is the specified one (\"This lane is closed.\"), followed by the clause every case that goes to a person ends with; the operator's was written by that session and has had no review.",
+      "written_by": "The Claude Code session that built this module, 2026-08-30, commit 5084a76 on openparking-ai-code/gate-agent -- EXCEPT the two `vehicle_too_close` lines (`ticket.vend_refused.vehicle_too_close` and `operator.vend_refused.vehicle_too_close`), added 2026-09-20 by a later session when the lane's refusal set gained that code. The driver's English sentence was approved by the owner in its final wording; the operator's was reported to the owner and not objected to. AND EXCEPT the two `lane_closed` lines (`case.lane_closed` and `operator_case.lane_closed`), added 2026-10-06 by a later session: the driver's first sentence is the specified one (\"This lane is closed.\"), followed by the clause every case that goes to a person ends with; the operator's was written by that session and has had no review. AND EXCEPT the two `exit_not_settled` lines (`case.exit_not_settled` and `operator_case.exit_not_settled`), added 2026-11-12 by a later session when the lane gained that reason: both English sentences were approved by the owner in their final wording.",
       "from": "Nothing. English is the SOURCE: every line was written here first and every other language is a translation of it.",
       "reviewed_by": "No professional editor and no native-speaker review. The words are held to what plays only by the sha256 rows below."
     },
     "es-ES": {
       "written_by": "The same session and the same commit as the English. It is a MACHINE TRANSLATION in the ordinary sense -- written by the model that wrote the English, not by a translator and not by a translation service.",
       "from": "The English line of the same key, in `gate_agent.lines.TEXT`.",
-      "reviewed_by": "No native speaker and no professional translator. It was read line by line against its English source by an independent review session on 2026-08-30, which found every line a faithful rendering in a consistent `usted` register -- that is a check on FAITHFULNESS, not a sign-off on register or regional fit. THAT REVIEW DID NOT SEE the two `vehicle_too_close` lines: they were added 2026-09-20, are machine translations of their approved English in the same sense as the rest, and have had no review of any kind -- no native speaker, no professional translator, and no independent read against the English. Nor did it see the two `lane_closed` lines, added 2026-10-06 the same way and unreviewed in the same way.",
+      "reviewed_by": "No native speaker and no professional translator. It was read line by line against its English source by an independent review session on 2026-08-30, which found every line a faithful rendering in a consistent `usted` register -- that is a check on FAITHFULNESS, not a sign-off on register or regional fit. THAT REVIEW DID NOT SEE the two `vehicle_too_close` lines: they were added 2026-09-20, are machine translations of their approved English in the same sense as the rest, and have had no review of any kind -- no native speaker, no professional translator, and no independent read against the English. Nor did it see the two `lane_closed` lines, added 2026-10-06 the same way and unreviewed in the same way, nor the two `exit_not_settled` lines, added 2026-11-12 the same way and unreviewed in the same way.",
       "register": "Castilian. `matrícula`, `aparcamiento`, `Pulse`. This is why the key is `es-ES` and not `es`: at a garage in Texas or Bogotá several of those words are wrong, and a generic tag would have chosen a register for that site's drivers without telling anybody."
     }
   },
@@ -128,6 +128,18 @@
       "text_provenance": "en",
       "sha256": "2f45de4cdbe97fa68adabb38c5fe2d4749050212d63328dfbe308e6420d24b49",
       "bytes": 68014,
+      "sample_rate": 8000,
+      "voice": "en-us",
+      "words_per_minute": 150,
+      "licence": "espeak-ng-formant"
+    },
+    "en/case.exit_not_settled.wav": {
+      "line": "case.exit_not_settled",
+      "language": "en",
+      "text": "Your exit is not settled yet. I am connecting you to a person.",
+      "text_provenance": "en",
+      "sha256": "8d4734169377a9f63a37c67757dfaa2403643347fc6a233881d8892b5d089db8",
+      "bytes": 71208,
       "sample_rate": 8000,
       "voice": "en-us",
       "words_per_minute": 150,
@@ -613,6 +625,18 @@
       "words_per_minute": 150,
       "licence": "espeak-ng-formant"
     },
+    "en/operator_case.exit_not_settled.wav": {
+      "line": "operator_case.exit_not_settled",
+      "language": "en",
+      "text": "The car at this exit has not paid and has not been let out yet.",
+      "text_provenance": "en",
+      "sha256": "9c0e32e4ac0e2b68402887bbc6b0f83a6dfbfe9e5a8bd1337dd3a10c26f3c514",
+      "bytes": 71554,
+      "sample_rate": 8000,
+      "voice": "en-us",
+      "words_per_minute": 150,
+      "licence": "espeak-ng-formant"
+    },
     "en/operator_case.identification_unavailable.wav": {
       "line": "operator_case.identification_unavailable",
       "language": "en",
@@ -932,6 +956,18 @@
       "text_provenance": "es-ES",
       "sha256": "39d17b05757c20e081a44eb50b99f205dc85d9d8b3fbee031ca7c72072867ac5",
       "bytes": 70244,
+      "sample_rate": 8000,
+      "voice": "es",
+      "words_per_minute": 150,
+      "licence": "espeak-ng-formant"
+    },
+    "es-ES/case.exit_not_settled.wav": {
+      "line": "case.exit_not_settled",
+      "language": "es-ES",
+      "text": "Su salida aún no está liquidada. Le paso con una persona.",
+      "text_provenance": "es-ES",
+      "sha256": "d141252442952e979b693cc447a5ffeaffeb712aff3abb967be0a818bde7e520",
+      "bytes": 70044,
       "sample_rate": 8000,
       "voice": "es",
       "words_per_minute": 150,
@@ -1412,6 +1448,18 @@
       "text_provenance": "es-ES",
       "sha256": "fd7c3ba35d866cae6505c3baa74154508f495ffee243138f66c39659eedaa924",
       "bytes": 30670,
+      "sample_rate": 8000,
+      "voice": "es",
+      "words_per_minute": 150,
+      "licence": "espeak-ng-formant"
+    },
+    "es-ES/operator_case.exit_not_settled.wav": {
+      "line": "operator_case.exit_not_settled",
+      "language": "es-ES",
+      "text": "El coche de esta salida no ha pagado y todavía no se le ha dejado salir.",
+      "text_provenance": "es-ES",
+      "sha256": "b41c95cf8fe716dcfe81b57f1ba1d5632e02461b5f6021e23c41e9d0a492ff2b",
+      "bytes": 76204,
       "sample_rate": 8000,
       "voice": "es",
       "words_per_minute": 150,

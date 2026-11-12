@@ -91,7 +91,10 @@ TEXT_PROVENANCE: dict[str, dict] = {
         "and `operator_case.lane_closed`), added 2026-10-06 by a later session: the "
         "driver's first sentence is the specified one (\"This lane is closed.\"), followed by "
         "the clause every case that goes to a person ends with; the operator's was written "
-        "by that session and has had no review.",
+        "by that session and has had no review. AND EXCEPT the two `exit_not_settled` lines "
+        "(`case.exit_not_settled` and `operator_case.exit_not_settled`), added 2026-11-12 "
+        "by a later session when the lane gained that reason: both English sentences were "
+        "approved by the owner in their final wording.",
         "from": "Nothing. English is the SOURCE: every line was written here first and "
         "every other language is a translation of it.",
         "reviewed_by": "No professional editor and no native-speaker review. The words are "
@@ -111,7 +114,8 @@ TEXT_PROVENANCE: dict[str, dict] = {
         "as the rest, and have had no review of any kind -- no native speaker, no "
         "professional translator, and no independent read against the English. Nor did it "
         "see the two `lane_closed` lines, added 2026-10-06 the same way and unreviewed "
-        "in the same way.",
+        "in the same way, nor the two `exit_not_settled` lines, added 2026-11-12 the same "
+        "way and unreviewed in the same way.",
         "register": "Castilian. `matrícula`, `aparcamiento`, `Pulse`. This "
         "is why the key is `es-ES` and not `es`: at a garage in Texas or Bogotá several of "
         "those words are wrong, and a generic tag would have chosen a register for that "

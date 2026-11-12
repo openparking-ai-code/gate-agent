@@ -63,6 +63,9 @@ REQUIRED_FALLBACK_REASONS: tuple[str, ...] = (
     "unknown_vehicle",
     "stale_rules",
     "engine_unreachable",
+    #: An exit the lane could not settle by itself: the gate opens only when
+    #: the platform says the stay is settled, or a person lets the car out.
+    "exit_not_settled",
     #: The lane is closed by its owner and did not open for this car by
     #: itself. A person's word through this intercom still opens it.
     "lane_closed",
@@ -92,6 +95,7 @@ FALLBACK_CASES: dict[str, AgentCase] = {
     "low_confidence": AgentCase.PLATE_UNCLEAR,
     "unknown_vehicle": AgentCase.VEHICLE_NOT_RECOGNISED,
     "stale_rules": AgentCase.RULES_UNAVAILABLE,
+    "exit_not_settled": AgentCase.EXIT_NOT_SETTLED,
     "lane_closed": AgentCase.LANE_CLOSED,
 }
 

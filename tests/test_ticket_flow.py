@@ -272,6 +272,9 @@ def foreign_decides(agent, lane, reason, presence=True, outcome="fallback"):
         # lane could not check its rules, which is not a question about who this
         # vehicle is.
         ("stale_rules", AgentCase.RULES_UNAVAILABLE, False),
+        # An exit not settled is not a question about who this vehicle is
+        # either: the car is leaving, and a ticket would be an entry.
+        ("exit_not_settled", AgentCase.EXIT_NOT_SETTLED, False),
     ],
 )
 def test_the_case_decides_whether_a_ticket_is_offered(tmp_path, reason, case, offered):

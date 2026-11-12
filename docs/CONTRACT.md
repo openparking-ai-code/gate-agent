@@ -484,6 +484,7 @@ without adding it here.
     "plate_unclear",
     "vehicle_not_recognised",
     "rules_unavailable",
+    "exit_not_settled",
     "entry_refused",
     "vehicle_not_detected",
     "entry_not_confirmed",
@@ -2719,6 +2720,7 @@ confirmed.
 | `outcome: fallback`, `reason: low_confidence` | `plate_unclear` | the instruction, then a person |
 | `outcome: fallback`, `reason: unknown_vehicle` | `vehicle_not_recognised` | a person |
 | `outcome: fallback`, `reason: stale_rules` | `rules_unavailable` | a person |
+| `outcome: fallback`, `reason: exit_not_settled` — an exit the lane could not settle by itself | `exit_not_settled` | a person |
 | `outcome: deny` | `entry_refused` | a person |
 | `outcome: no_vehicle` | `vehicle_not_detected` | a person |
 | `outcome: allow`, transit `held` or `unconfirmable` | `entry_not_confirmed` | a person |
