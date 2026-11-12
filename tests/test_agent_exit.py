@@ -59,6 +59,13 @@ def when_it_is_up():
         if open(FB, "rb").read() == BLANK:
             break
         time.sleep(0.02)
+    # ...and the screen is blanked at startup well before the exit path is armed.
+    # Wait for the agent to reach `serve_forever`, which comes right after the
+    # step that routes `SIGTERM` into the `finally` (or after that step's removal,
+    # in the controls): a signal sent earlier ends the process by Python's
+    # default and measures the start-up, not the exit. On a busy runner that gap
+    # outlasted the fixed pause that used to stand here.
+    SERVING.wait(timeout=30)
     # A ticket on the screen.
     with open(FB, "wb") as handle:
         handle.write(bytes([{frame}]) * SIZE)
@@ -67,6 +74,23 @@ def when_it_is_up():
 
 
 {break_}
+SERVING = threading.Event()
+_make_agent_server = cli.make_agent_server
+
+
+def _marking_server(*args, **kwargs):
+    server = _make_agent_server(*args, **kwargs)
+    serve = server.serve_forever
+
+    def serve_forever(*a, **k):
+        SERVING.set()
+        return serve(*a, **k)
+
+    server.serve_forever = serve_forever
+    return server
+
+
+cli.make_agent_server = _marking_server
 threading.Thread(target=when_it_is_up, daemon=True).start()
 raise SystemExit(cli.main(["agent", "--config", {config!r}, "--port", "0"]))
 """

@@ -17,16 +17,20 @@ added to either side alone goes red on that side's next run:
 
 **PINNED to a platform commit (`PLATFORM_COMMIT`)**, never to `main`: a moving
 target on the other side of a boundary is a check that changes meaning without a
-commit here. `--from-file` compares against a local copy instead, which is how
-the plants in `tests/test_screen_characters.py` are measured without a network.
+commit here. The platform repository is private, so the pinned copy is fetched
+with git (`git fetch` of that one commit, which uses whatever read access git
+has: the CI read key, or the reader's own login), never from a public address.
+`--from-file` compares against a local copy instead, which is how the plants in
+`tests/test_screen_characters.py` are measured without a network.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
-import urllib.request
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +41,18 @@ from gate_agent.font import DRAWABLE  # noqa: E402
 #: The platform commit whose copy this build is held to.
 PLATFORM_COMMIT = "a82a761495d62f85cb3df6f4d33ce81f1fb4e7fc"
 PLATFORM_PATH = "src/screen-characters.json"
-URL = "https://raw.githubusercontent.com/openparking-ai-code/platform/{commit}/{path}"
+PLATFORM_REPO = "https://github.com/openparking-ai-code/platform"
+
+
+def fetch_pinned_copy() -> str:
+    """The platform's copy at `PLATFORM_COMMIT`, fetched with git (the repository is private)."""
+    with tempfile.TemporaryDirectory() as work:
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", work, *args], check=True,
+                                  capture_output=True, text=True).stdout
+        git("init", "-q")
+        git("fetch", "-q", "--depth", "1", PLATFORM_REPO, PLATFORM_COMMIT)
+        return git("show", f"FETCH_HEAD:{PLATFORM_PATH}")
 
 
 def platform_copy(text: str) -> frozenset[str]:
@@ -69,9 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.from_file is not None:
         text, where = args.from_file.read_text(encoding="utf-8"), str(args.from_file)
     else:
-        url = URL.format(commit=PLATFORM_COMMIT, path=PLATFORM_PATH)
-        with urllib.request.urlopen(url, timeout=30) as response:  # noqa: S310 - fixed https URL
-            text, where = response.read().decode("utf-8"), url
+        text, where = fetch_pinned_copy(), f"{PLATFORM_REPO} at {PLATFORM_COMMIT}"
     try:
         problems = compare(platform_copy(text))
     except ValueError as exc:
