@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from gate_agent.font import DRAWABLE  # noqa: E402
 
 #: The platform commit whose copy this build is held to.
-PLATFORM_COMMIT = "7e043f33d274a7eb5b67dc0bf9d16e6f7aa6c72d"
+PLATFORM_COMMIT = "a82a761495d62f85cb3df6f4d33ce81f1fb4e7fc"
 PLATFORM_PATH = "src/screen-characters.json"
 URL = "https://raw.githubusercontent.com/openparking-ai-code/platform/{commit}/{path}"
 

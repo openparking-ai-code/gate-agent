@@ -2,11 +2,22 @@ name: CI
 
 on:
   pull_request:
+    # ready_for_review is listed because the heavy jobs below skip draft pull
+    # requests: marking one ready runs everything, and so does every push to it
+    # after that. Drafts cannot be merged.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
 
 permissions:
   contents: read
+
+# A newer push to the same pull request stops this workflow's older run on
+# it: that commit can no longer be merged. Runs on main are never stopped or
+# replaced: each has a group of its own (its commit).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
@@ -30,7 +41,16 @@ jobs:
         # of a lane's message this font cannot draw. Its list is a copy;
         # this compares it, at a pinned platform commit, to `font.DRAWABLE`.
         # Before the pin check below, so it is measured whatever that one says.
-        run: python scripts/check_screen_characters.py
+        # The platform repo is private, so the copy is fetched over git (read
+        # key above) at the pinned commit and compared as a local file.
+        run: |
+          commit=$(sed -n 's/^PLATFORM_COMMIT = "\([0-9a-f]\{40\}\)"$/\1/p' scripts/check_screen_characters.py)
+          [ -n "$commit" ] || { echo "FAIL: PLATFORM_COMMIT not found in scripts/check_screen_characters.py"; exit 1; }
+          dir="$RUNNER_TEMP/platform-copy"
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 https://github.com/openparking-ai-code/platform "$commit"
+          git -C "$dir" show FETCH_HEAD:src/screen-characters.json > "$RUNNER_TEMP/screen-characters.json"
+          python scripts/check_screen_characters.py --from-file "$RUNNER_TEMP/screen-characters.json"
 
       - name: The lane-controller pin names a commit on lane-controller main
         # A pin to a feature-branch commit resolves until that branch is
@@ -89,6 +109,8 @@ jobs:
 
   fail-control:
     name: fail-control (${{ matrix.python-version }}, ${{ matrix.part.script }} ${{ matrix.part.index }}/${{ matrix.part.count }})
+    # Skipped on a draft pull request (see `on:`); runs on every other one and on main.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: plan
     runs-on: ubuntu-latest
     # Each shard is cut to an estimated pool time of `_shard.BUDGET_S` (600 s),
@@ -103,9 +125,12 @@ jobs:
       # a cancelled shard is a slice of breaks nobody measured.
       fail-fast: false
       matrix:
-        # BOTH INTERPRETERS, as before. A fail-control is cheap signal about
-        # the interpreter, and dropping a leg is measuring less.
-        python-version: ['3.11', '3.12']
+        # On a pull request 3.12 only; on main BOTH interpreters, as before --
+        # every merge still measures 3.11 too. (One leg on pull requests halves
+        # the runner minutes; there is no weekly run in this repository, so
+        # main is where 3.11's fail-controls run.) `test (3.11)` skips its
+        # coverage check on pull requests to match.
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.11", "3.12"]') }}
         part: ${{ fromJSON(needs.plan.outputs.parts) }}
     steps:
       - uses: actions/checkout@v4
@@ -289,7 +314,9 @@ jobs:
         run: pytest -q
 
       - name: Collect what every fail-control shard ran
-        if: always()
+        # Not on a draft (no fail-controls run there), and on a pull request only
+        # for 3.12, the one interpreter its fail-controls run on (see the matrix).
+        if: always() && (github.event_name != 'pull_request' || (!github.event.pull_request.draft && matrix.python-version == '3.12'))
         uses: actions/download-artifact@v4
         with:
           pattern: coverage-${{ matrix.python-version }}-*
@@ -301,7 +328,8 @@ jobs:
         # i/N, indices a..b` line and exit status, for THIS interpreter, against
         # the counts the scripts themselves printed in `plan` -- a shard that was
         # killed, cancelled or never scheduled has no report, and that is red.
-        if: always()
+        # Same condition as the step above.
+        if: always() && (github.event_name != 'pull_request' || (!github.event.pull_request.draft && matrix.python-version == '3.12'))
         env:
           PLAN: ${{ needs.plan.outputs.plan }}
         run: python scripts/_shard.py verify coverage "$PLAN"
